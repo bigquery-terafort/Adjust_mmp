@@ -1,1 +1,2 @@
-
+requests>=2.31.0
+google-cloud-bigquery>=3.20.0
