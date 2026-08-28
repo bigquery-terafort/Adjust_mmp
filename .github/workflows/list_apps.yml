@@ -1,0 +1,82 @@
+name: List Adjust Apps (app_tokens.txt banao)
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  YE KYA KARTA HAI
+#  ────────────────
+#  Adjust se SAARE app tokens laata hai aur do file bana ke repo mein
+#  KHUD COMMIT kar deta hai:
+#
+#      app_tokens.txt     ← main loader isay padhta hai
+#      adjust_apps.csv    ← naam, token, installs, revenue (insaan ke liye)
+#
+#  Ek hi secret chahiye — ADJUST_API_TOKEN (jo pehle se set hai).
+#
+#  KAB CHALANA HAI
+#  ───────────────
+#   · Pehli baar setup pe
+#   · Jab naye apps Adjust mein add hon
+#   · Warna kabhi kabhaar — ye khud-ba-khud nahi chalta (sirf manual)
+# ═══════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: "Kitne din pichhe tak dekhein (365 = zyada apps milenge)"
+        required: false
+        default: "365"
+      commit:
+        description: "1 = files repo mein commit kar do, 0 = sirf dikhao"
+        required: false
+        default: "1"
+
+permissions:
+  contents: write        # commit karne ke liye
+
+jobs:
+  list-apps:
+    name: Adjust apps discover karo
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Adjust se apps laao
+        env:
+          ADJUST_API_TOKEN: ${{ secrets.ADJUST_API_TOKEN }}
+          LOOKBACK_DAYS:    ${{ github.event.inputs.lookback_days || '365' }}
+          OUT_TOKENS:       app_tokens.txt
+          OUT_CSV:          adjust_apps.csv
+        run: python list_adjust_apps.py
+
+      # Script fail ho to yahan tak pahuncha hi nahi jayega — aur wo fail
+      # hone pe file likhti bhi nahi (purani mehfooz rehti hai).
+      - name: app_tokens.txt commit karo
+        if: ${{ github.event.inputs.commit != '0' }}
+        run: |
+          git config user.name  "adjust-bot"
+          git config user.email "adjust-bot@users.noreply.github.com"
+          git add app_tokens.txt adjust_apps.csv
+          git commit -m "chore: Adjust app tokens refresh [skip ci]" || {
+            echo "Koi tabdeeli nahi — commit ki zaroorat nahi"
+            exit 0
+          }
+          git push
+          echo "✅ app_tokens.txt commit ho gayi"
+
+      - name: Khulasa
+        run: |
+          echo "── app_tokens.txt (pehli 15 line) ──"
+          head -15 app_tokens.txt || true
+          echo ""
+          echo "Kul tokens: $(grep -vc '^\s*#\|^\s*$' app_tokens.txt || echo 0)"
