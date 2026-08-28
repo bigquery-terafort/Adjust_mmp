@@ -1,4 +1,4 @@
-name: Adjust → BigQuery Sync
+name: Adjust → BigQuery Sync (v2 — sab kuch)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SETUP — ek baar
@@ -37,6 +37,10 @@ on:
         description: "Ek request mein kitne app tokens (0 = sab ek saath)"
         required: false
         default: "50"
+      reports:
+        description: "Kaunsi tables — app,campaign,country (comma se)"
+        required: false
+        default: "app,campaign,country"
       dry_run:
         description: "1 = fetch karo lekin BigQuery ko haath mat lagao"
         required: false
@@ -57,7 +61,7 @@ jobs:
     # Bounded — na be-had, na itna chhota ke retries ka mauqa hi na mile.
     # (Ek purane loader ko GitHub ne 60-min pe maar diya tha jab wo 80% pe
     #  atka hua tha; script ke apne timeouts ko chalne ka mauqa milna chahiye.)
-    timeout-minutes: 60
+    timeout-minutes: 180
 
     steps:
       - name: Checkout
@@ -69,10 +73,13 @@ jobs:
           python-version: "3.11"
           cache: pip
 
+      # requirements.txt repo root mein hona chahiye — `cache: pip` usi ko
+      # hash karta hai. Agar wo file na ho to setup-python step FAIL ho jata
+      # hai (run #2 mein yehi hua).
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests google-cloud-bigquery
+          pip install -r requirements.txt
 
       - name: Run Adjust → BigQuery sync
         env:
@@ -85,16 +92,18 @@ jobs:
           # ── config ──
           APP_TOKENS_FILE:  app_tokens.txt
           BQ_DATASET:       adjust_data
-          BQ_TABLE:         app_daily_performance
           BQ_LOCATION:      US
           LOOKBACK_DAYS:    ${{ github.event.inputs.lookback_days || '30' }}
-          CHUNK_SIZE:       ${{ github.event.inputs.chunk_size    || '50' }}
+          CHUNK_SIZE:       ${{ github.event.inputs.chunk_size    || '25' }}
           DRY_RUN:          ${{ github.event.inputs.dry_run       || '0'  }}
+          # Kaunsi tables banani hain. Teeno = app,campaign,country
+          # Ek hi chahiye to sirf uska key likho, jaise: campaign
+          REPORTS:          ${{ github.event.inputs.reports || 'app,campaign,country' }}
           MAX_RETRIES:      "5"
-          REQUEST_TIMEOUT:  "180"
+          REQUEST_TIMEOUT:  "300"
           UTC_OFFSET:       "+00:00"
           ATTRIBUTION_TYPE: "all"
-        run: python adjust_to_bigquery.py
+        run: python adjust_to_bigquery_v2.py
 
       # Script khud exit(1) karti hai jab koi masla ho (chahe kuch data
       # load ho chuka ho). Ye step usay saaf tarah surface karta hai —
