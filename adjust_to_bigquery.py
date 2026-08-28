@@ -143,7 +143,17 @@ APP_TOKENS_FILE = os.environ.get("APP_TOKENS_FILE", "app_tokens.txt")
 # Adjust dimensions/metrics.
 #   `app_token` bhi maangte hain (sirf `app` naam nahi) — kyunki naam badal
 #   sakta hai, token nahi. DELETE guard aur joins isi par chalte hain.
-DIMENSIONS = ["day", "app", "app_token"]
+#   `store_id` SAB SE AHEM hai — yehi app_master_v2 ka join key deta hai:
+#       Android → store_id = "com.example.app"  → app_master_v2.android_package
+#       iOS     → store_id = "1234567890"       → app_master_v2.apple_id
+#
+#   Ye sabaq aaj ke audit se aaya: jin platforms pe store key nahi thi,
+#   wahan paisa "unmapped" pada raha —
+#       TikTok       $45.52   (app_id tha, package nahi)
+#       Facebook  $1,049.54   (promoted_object khali)
+#       Google Ads $12,644.96 (package conversion-action ke NAAM se nikalna pada)
+#   Adjust store_id deta hai, to pehle din se le lete hain.
+DIMENSIONS = ["day", "app", "app_token", "store_id", "store_type", "os_name"]
 METRICS    = ["installs", "clicks", "sessions", "revenue"]
 
 RUN_ID = f"{date.today().isoformat()}-{int(time.time())}"
@@ -179,6 +189,20 @@ SCHEMA = [
                          description="Adjust app token — stable join key"),
     bigquery.SchemaField("app_name",     "STRING",
                          description="Adjust 'app' dimension — badal sakta hai"),
+
+    # ── STORE KEYS: yehi app_master_v2 se jodte hain ──
+    bigquery.SchemaField("store_id",     "STRING",
+                         description="Adjust store_id — android package ya iOS numeric id"),
+    bigquery.SchemaField("store_type",   "STRING",
+                         description="google_play / itunes / etc"),
+    bigquery.SchemaField("os_name",      "STRING",
+                         description="android / ios"),
+    # store_id se nikale gaye — staging ka join in par seedha chalta hai
+    bigquery.SchemaField("android_package", "STRING",
+                         description="DERIVED: android hone par store_id (lowercased)"),
+    bigquery.SchemaField("apple_id",        "INTEGER",
+                         description="DERIVED: iOS hone par store_id (numeric)"),
+
     bigquery.SchemaField("installs",     "INTEGER"),
     bigquery.SchemaField("clicks",       "INTEGER"),
     bigquery.SchemaField("sessions",     "INTEGER"),
@@ -208,8 +232,23 @@ def load_app_tokens() -> list:
             tokens = [ln.split("#", 1)[0].strip() for ln in fh]
         src = f"file {APP_TOKENS_FILE}"
     else:
+        # 🔎 Andaza lagane ke bajaye DIKHAO ke script ko kya nazar aa raha hai.
+        #    (GitHub Actions pe "file to repo mein hai!" wali behes yahin
+        #     khatam ho jati hai.)
+        cwd = os.getcwd()
+        log.error("Working directory: %s", cwd)
+        try:
+            here = sorted(os.listdir(cwd))
+            log.error("Yahan ye files hain (%d):", len(here))
+            for f in here[:40]:
+                mark = "  👈 ye chahiye tha" if f == APP_TOKENS_FILE else ""
+                log.error("   • %s%s", f, mark)
+            if len(here) > 40:
+                log.error("   ... aur %d", len(here) - 40)
+        except OSError as exc:
+            log.error("Directory padh nahi paye: %s", exc)
         die(f"App tokens nahi mile — na ADJUST_APP_TOKENS env mein, "
-            f"na {APP_TOKENS_FILE} file mein.")
+            f"na '{APP_TOKENS_FILE}' file mein (upar wali listing dekho).")
 
     # saaf karo: khali, duplicate — lekin tarteeb barqarar rakho
     seen, clean = set(), []
@@ -219,7 +258,9 @@ def load_app_tokens() -> list:
             clean.append(t)
 
     if not clean:
-        die(f"{src} mein ek bhi valid app token nahi mila.")
+        die(f"{src} mein ek bhi valid app token nahi mila — "
+            f"file khali hai ya sirf comments hain. "
+            f"Format: ek token per line, '#' se comment.")
 
     dupes = len(tokens) - len([t for t in tokens if t]) * 0 - len(clean)
     log.info("App tokens: %d unique (%s)%s",
@@ -334,6 +375,48 @@ def _to_float(v):
         return 0.0
 
 
+def derive_store_keys(store_id, store_type, os_name):
+    """
+    Adjust ka `store_id` → app_master_v2 ke join keys.
+
+        Android : "com.example.app"  → android_package
+        iOS     : "1234567890"       → apple_id (INT64)
+
+    Faisla os_name/store_type par, aur shakl par bhi (dono se tasdeeq).
+    Kuch samajh na aaye to DONO None — jhoota mapping banane se behtar hai
+    ke row unmapped rahe aur monitor use pakde.
+    """
+    sid = (store_id or "").strip()
+    if not sid:
+        return None, None
+
+    os_l = (os_name or "").strip().lower()
+    st_l = (store_type or "").strip().lower()
+
+    is_ios = ("ios" in os_l) or ("itunes" in st_l) or ("apple" in st_l)
+    is_and = ("android" in os_l) or ("google" in st_l) or ("play" in st_l)
+
+    if sid.isdigit():
+        # sirf numeric = App Store id (Android package mein hamesha dot hota hai)
+        if is_and:
+            log.warning("  store_id numeric hai lekin os=android: %s", sid)
+            return None, None
+        try:
+            return None, int(sid)
+        except ValueError:
+            return None, None
+
+    if "." in sid:
+        # dotted = package/bundle
+        if is_ios:
+            # iOS ka bundle id — apple_id nahi. Master `ios_bundle_id` rakhta
+            # hai, isliye android_package mein daalna GALAT hoga.
+            return None, None
+        return sid.lower(), None
+
+    return None, None
+
+
 def fetch_chunk(tokens: list, start: date, end: date, label: str):
     """
     Ek chunk (app tokens ka guchha) ka data.
@@ -379,10 +462,20 @@ def fetch_chunk(tokens: list, start: date, end: date, label: str):
             skipped += 1
             continue
 
+        store_id   = (r.get("store_id") or "").strip() or None
+        store_type = (r.get("store_type") or "").strip() or None
+        os_name    = (r.get("os_name") or "").strip() or None
+        and_pkg, app_id = derive_store_keys(store_id, store_type, os_name)
+
         rows.append({
             "date":         day,
             "app_token":    tok,
             "app_name":     r.get("app"),
+            "store_id":     store_id,
+            "store_type":   store_type,
+            "os_name":      os_name,
+            "android_package": and_pkg,
+            "apple_id":        app_id,
             "installs":     _to_int(r.get("installs")),
             "clicks":       _to_int(r.get("clicks")),
             "sessions":     _to_int(r.get("sessions")),
@@ -402,6 +495,14 @@ def fetch_chunk(tokens: list, start: date, end: date, label: str):
         # lekin log zaroor hona chahiye — #5 wala sabaq.
         log.info("  %s: %d/%d tokens ka koi data nahi aaya (activity nahi?)",
                  label, len(silent), len(tokens))
+
+    no_key = sum(1 for r in rows
+                 if not r["android_package"] and not r["apple_id"])
+    if no_key:
+        # 🔎 Ye ginti roz dekhni chahiye — barh jaye to naye apps aaye hain
+        #    jinka store_id nahi mil raha (unka paisa unmapped rahega).
+        log.warning("  %s: %d rows mein koi store key nahi (unmapped rahenge)",
+                    label, no_key)
 
     log.info("  %s: %d rows, %d apps", label, len(rows), len(seen_tokens))
 
@@ -453,7 +554,7 @@ def ensure_dataset_and_table(client: bigquery.Client) -> str:
         table.time_partitioning = bigquery.TimePartitioning(
             type_=bigquery.TimePartitioningType.DAY, field="date"
         )
-        table.clustering_fields = ["app_token"]
+        table.clustering_fields = ["app_token", "android_package"]
         client.create_table(table)
         return tbl_ref
 
