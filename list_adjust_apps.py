@@ -79,7 +79,8 @@ def fetch_all_apps(start: date, end: date):
     params = {
         # 👇 app_token__in JAAN-BOOJH KE nahi diya — tabhi SAB apps aate hain
         "date_period": f"{start.isoformat()}:{end.isoformat()}",
-        "dimensions":  "app,app_token",
+        # store_id/store_type/os_name bhi — yehi app_master_v2 ka join key hai
+        "dimensions":  "app,app_token,store_id,store_type,os_name",
         "metrics":     "installs,clicks,sessions,revenue",
         "utc_offset":  UTC_OFFSET,
     }
@@ -159,10 +160,14 @@ def main():
             no_token += 1
             continue
         a = apps.setdefault(tok, {"name": r.get("app") or "",
+                                  "store_id": "", "store_type": "", "os_name": "",
                                   "installs": 0.0, "clicks": 0.0,
                                   "sessions": 0.0, "revenue": 0.0})
         if not a["name"] and r.get("app"):
             a["name"] = r["app"]
+        for f in ("store_id", "store_type", "os_name"):
+            if not a[f] and r.get(f):
+                a[f] = str(r[f]).strip()
         for m in ("installs", "clicks", "sessions", "revenue"):
             a[m] += num(r.get(m))
 
@@ -204,16 +209,23 @@ def main():
         fh.write(f"# Source: Report Service, window {start} → {end}\n")
         fh.write(f"# Kul {len(apps)} apps\n\n")
         for tok, a in sorted(apps.items(), key=lambda x: -x[1]["installs"]):
-            fh.write(f"{tok}    # {a['name']}\n")
+            key = a["store_id"] or "⚠️ STORE_ID NAHI"
+            fh.write(f"{tok}    # {a['name']}  |  {key}\n")
     log.info("📄 %s likh di (%d tokens)", OUT_TOKENS, len(apps))
 
     # ── adjust_apps.csv ──
     with open(OUT_CSV, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
-        w.writerow(["app_token", "app_name", "installs", "clicks",
-                    "sessions", "revenue"])
+        w.writerow(["app_token", "app_name", "store_id", "store_type",
+                    "os_name", "android_package", "apple_id",
+                    "installs", "clicks", "sessions", "revenue"])
         for tok, a in sorted(apps.items(), key=lambda x: -x[1]["installs"]):
-            w.writerow([tok, a["name"], int(a["installs"]), int(a["clicks"]),
+            sid, os_l = a["store_id"], a["os_name"].lower()
+            and_pkg = sid.lower() if ("." in sid and "ios" not in os_l) else ""
+            app_id  = sid if sid.isdigit() else ""
+            w.writerow([tok, a["name"], sid, a["store_type"], a["os_name"],
+                        and_pkg, app_id,
+                        int(a["installs"]), int(a["clicks"]),
                         int(a["sessions"]), round(a["revenue"], 4)])
     log.info("📄 %s likh di", OUT_CSV)
 
@@ -227,11 +239,22 @@ def main():
     log.info("Kul revenue : %s", f"{tot_r:,.2f}")
     if zero:
         log.info("0 installs wale: %d (phir bhi shaamil hain)", zero)
+
+    # 🔑 Store key coverage — mapping ke liye sab se ahem ginti
+    no_sid = [t for t, a in apps.items() if not a["store_id"]]
+    log.info("store_id maujood : %d/%d apps", len(apps) - len(no_sid), len(apps))
+    if no_sid:
+        log.warning("⚠️  %d apps ka store_id NAHI mila — inka data BigQuery mein",
+                    len(no_sid))
+        log.warning("    aayega lekin app_master_v2 se JUD NAHI payega:")
+        for t in no_sid[:10]:
+            log.warning("       %s  %s", t, apps[t]["name"][:45])
     log.info("─" * 60)
     log.info("Top 10:")
     for tok, a in sorted(apps.items(), key=lambda x: -x[1]["installs"])[:10]:
-        log.info("  %-14s %-40s %10s installs",
-                 tok, a["name"][:40], f"{int(a['installs']):,}")
+        log.info("  %-14s %-32s %-34s %9s inst",
+                 tok, a["name"][:32], (a["store_id"] or "—")[:34],
+                 f"{int(a['installs']):,}")
     log.info("─" * 60)
     log.info("⚠️  Ye ginti Adjust dashboard ke app count se MILAA lena.")
     log.info("    Farq ho to wo apps hain jinki is window mein koi activity")
