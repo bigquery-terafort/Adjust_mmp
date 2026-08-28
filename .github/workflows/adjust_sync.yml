@@ -1,1 +1,141 @@
-di
+name: Adjust → BigQuery Sync
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SETUP — ek baar
+#  ──────────────
+#  Settings → Secrets and variables → Actions → New repository secret:
+#
+#    ADJUST_API_TOKEN        Adjust global API token
+#    GCP_PROJECT             GCP project id
+#    GCP_CREDENTIALS_JSON    service-account JSON — POORA content paste karo
+#                            (roles: BigQuery Data Editor + Job User)
+#    ADJUST_APP_TOKENS       (optional) 200 tokens comma-separated
+#
+#  App tokens ke liye do rasté:
+#    A) ADJUST_APP_TOKENS secret — comma-separated
+#    B) repo mein `app_tokens.txt` — ek token per line, `#` se comment
+#       200 tokens ke liye (B) zyada aasan hai: git diff se pata chalta hai
+#       ke kaunsa app kab add/remove hua.
+#
+#  ⚠️ PEHLA RUN "Run workflow" se, dry_run = 1 rakh ke karo.
+#     Wo BigQuery ko haath nahi lagata — sirf dikhata hai kitne rows aaye.
+# ═══════════════════════════════════════════════════════════════════════════
+
+on:
+  schedule:
+    # Roz 04:15 UTC (09:15 PKT). Adjust ka pichhle din ka data tab tak
+    # settle ho chuka hota hai.
+    - cron: "15 4 * * *"
+
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: "Kitne din pichhe tak (default 30)"
+        required: false
+        default: "30"
+      chunk_size:
+        description: "Ek request mein kitne app tokens (0 = sab ek saath)"
+        required: false
+        default: "50"
+      dry_run:
+        description: "1 = fetch karo lekin BigQuery ko haath mat lagao"
+        required: false
+        default: "0"
+
+# 🛡️ Do run ek saath chalein to dono DELETE karenge — bacho.
+concurrency:
+  group: adjust-bigquery-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Sync Adjust → BigQuery
+    runs-on: ubuntu-latest
+    # Bounded — na be-had, na itna chhota ke retries ka mauqa hi na mile.
+    # (Ek purane loader ko GitHub ne 60-min pe maar diya tha jab wo 80% pe
+    #  atka hua tha; script ke apne timeouts ko chalne ka mauqa milna chahiye.)
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests google-cloud-bigquery
+
+      - name: Run Adjust → BigQuery sync
+        env:
+          # ── secrets ──
+          ADJUST_API_TOKEN:     ${{ secrets.ADJUST_API_TOKEN }}
+          GCP_PROJECT:          ${{ secrets.GCP_PROJECT }}
+          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
+          ADJUST_APP_TOKENS:    ${{ secrets.ADJUST_APP_TOKENS }}
+
+          # ── config ──
+          APP_TOKENS_FILE:  app_tokens.txt
+          BQ_DATASET:       adjust_data
+          BQ_TABLE:         app_daily_performance
+          BQ_LOCATION:      US
+          LOOKBACK_DAYS:    ${{ github.event.inputs.lookback_days || '30' }}
+          CHUNK_SIZE:       ${{ github.event.inputs.chunk_size    || '50' }}
+          DRY_RUN:          ${{ github.event.inputs.dry_run       || '0'  }}
+          MAX_RETRIES:      "5"
+          REQUEST_TIMEOUT:  "180"
+          UTC_OFFSET:       "+00:00"
+          ATTRIBUTION_TYPE: "all"
+        run: python adjust_to_bigquery.py
+
+      # Script khud exit(1) karti hai jab koi masla ho (chahe kuch data
+      # load ho chuka ho). Ye step usay saaf tarah surface karta hai —
+      # taake koi run "green" dikhte hue chup-chaap data na khaye.
+      - name: Fail loudly
+        if: failure()
+        run: |
+          echo "::error::Adjust sync FAILED — upar ke logs mein 🔴 dhoondo."
+          echo "Jin apps ka fetch fail hua, unka purana data CHHUA NAHI gaya."
+          exit 1
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # KEEPALIVE — GitHub ka 60-din auto-disable
+  # ─────────────────────────────────────────
+  # GitHub 60 din tak repo mein koi commit na ho to scheduled workflows KHUD
+  # band kar deta hai. Owner ko email jata hai, jo aksar kisi ne nahi dekha.
+  #
+  # Ye theory nahi — tareekhon se saabit hai:
+  #     fx_rate   aakhri commit Apr 26 + 60 = Jun 25  →  data ruka Jun 26
+  #     admob ×3  aakhri commit May 20 + 60 = Jul 19  →  data ruka Jul 19
+  # Nuqsan: ~$27K AdMob revenue + 30 din FX rates, kisi ko pata bhi nahi chala.
+  #
+  # Ye job mahine ki 1 tareekh ko ek dummy commit karta hai — ghadi reset.
+  # ═══════════════════════════════════════════════════════════════════════════
+  keepalive:
+    name: Keepalive (60-din auto-disable se bachao)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Touch repo (mahine mein ek baar)
+        run: |
+          if [ "$(date -u +%d)" != "01" ]; then
+            echo "Aaj 1 tareekh nahi — skip"
+            exit 0
+          fi
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .keepalive
+          git config user.name  "keepalive-bot"
+          git config user.email "keepalive-bot@users.noreply.github.com"
+          git add .keepalive
+          git commit -m "chore: keepalive [skip ci]" || exit 0
+          git push
