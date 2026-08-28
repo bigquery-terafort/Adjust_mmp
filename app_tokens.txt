@@ -1,5 +1,5 @@
 # Adjust app tokens — 2026-08-28 ko banayi
-# Source: Report Service, window 2025-08-28 → 2026-08-27
+# Source: Report Service, window 2023-12-02 → 2026-08-27
 # Kul 141 apps
 
 fi60tzitdc00    # Prado Parking Game PP3D
