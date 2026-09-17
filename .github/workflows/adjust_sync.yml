@@ -103,7 +103,7 @@ jobs:
           REQUEST_TIMEOUT:  "300"
           UTC_OFFSET:       "+00:00"
           ATTRIBUTION_TYPE: "all"
-        run: python adjust_to_bigquery_v2.py
+        run: python adjust_to_bigquery.py
 
       # Script khud exit(1) karti hai jab koi masla ho (chahe kuch data
       # load ho chuka ho). Ye step usay saaf tarah surface karta hai —
