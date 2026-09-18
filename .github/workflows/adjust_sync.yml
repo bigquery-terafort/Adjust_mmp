@@ -146,12 +146,12 @@ jobs:
       # 🔁 RETRY — neeche wala main step 3 baar koshish karta hai.
       #    (nick-fields/retry se: platform API 5xx / timeout par khud dobara)
       - name: Install dependencies
-        if: steps.before.outputs.skip != 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run Adjust → BigQuery sync
+        if: steps.before.outputs.skip != 'true'
         env:
           # ── secrets ──
           ADJUST_API_TOKEN:     ${{ secrets.ADJUST_API_TOKEN }}
