@@ -1,6 +1,19 @@
 """
-Adjust Report Service  →  BigQuery   ·   "SAB KUCH" EDITION          v2.0
+Adjust Report Service  →  BigQuery   ·   "SAB KUCH" EDITION          v2.1
 ==========================================================================
+🆕 v2.1 (2026-09-17) — CHAAR badlav:
+   ① app_token REQUIRED — "changed mode from REQUIRED to NULLABLE" 400 fix
+   ② cohort_maturity=mature — SAB SE AHEM. Adjust ka default `immature` hai,
+      jo adhoore cohorts bhi gin leta hai → d7/d30 ROAS jhoota kam aata tha.
+   ③ ~30 naye metrics — poora cohort set d0..d90, ad_revenue cohort,
+      engagement, attribution breakdown, SKAdNetwork
+   ④ do naye report — `cohort` (period dimension = asli cohort table) aur
+      `event` (har custom event alag)
+
+   ⚠️ USER-LEVEL data Report Service API se MILTA HI NAHI. Us ke liye
+      Adjust Dashboard → Raw Data Export → Cloud Storage (GCS) chahiye,
+      phir GCS → BigQuery ka alag loader. Wo is script ka kaam nahi.
+
 v1 sirf 4 metrics aur app-level grain laata tha. v2 SAB kuch laata hai:
 har metric, har dimension, teen alag grain pe.
 
@@ -111,9 +124,15 @@ MAX_RETRIES      = int(os.environ.get("MAX_RETRIES", "5"))
 REQUEST_TIMEOUT  = int(os.environ.get("REQUEST_TIMEOUT", "300"))
 UTC_OFFSET       = os.environ.get("UTC_OFFSET", "+00:00")
 ATTRIBUTION_TYPE = os.environ.get("ATTRIBUTION_TYPE", "all")
+# 🆕 v2.1 — COHORT MATURITY: sab se ahem accuracy fix.
+#    Adjust ka default `immature` hai — d30 ROAS un cohorts ka bhi deta hai jo
+#    abhi 30 din purane hue hi nahi. Natija: adhoore numbers, ROAS jhoota kam.
+#    `mature` sirf POORE ho chuke cohorts deta hai, baqi par 0 — asli number.
+#    Dono chahiyen to do run karo: COHORT_MATURITY=mature aur =immature.
+COHORT_MATURITY  = os.environ.get("COHORT_MATURITY", "mature")
 DRY_RUN          = os.environ.get("DRY_RUN", "0") == "1"
 ENABLED_REPORTS  = [r.strip().lower() for r in
-                    os.environ.get("REPORTS", "app,campaign,country").split(",")
+                    os.environ.get("REPORTS", "app,campaign,country,cohort,event").split(",")
                     if r.strip()]
 
 APP_TOKENS_ENV  = os.environ.get("ADJUST_APP_TOKENS", "")
@@ -168,6 +187,26 @@ ALL_METRICS = [
     "roas_d0", "roas_d1", "roas_d7", "roas_d30",
     "revenue_total_d0", "revenue_total_d7", "revenue_total_d30",
     "lifetime_value",
+    # ── 🆕 v2.1: POORA cohort set (d0 se d90) ──
+    #    Negotiation khud ek-ek test karegi — jo Adjust na de wo chup-chaap gir
+    #    jayega (log ke saath). Is liye "sab maango" mehfooz hai.
+    "retained_users_d0", "retained_users_d3", "retained_users_d14",
+    "retained_users_d60", "retained_users_d90",
+    "retention_rate_d0", "retention_rate_d3", "retention_rate_d14",
+    "retention_rate_d60", "retention_rate_d90",
+    "roas_d3", "roas_d14", "roas_d60", "roas_d90",
+    "revenue_total_d1", "revenue_total_d3", "revenue_total_d14",
+    "revenue_total_d60", "revenue_total_d90",
+    # 🆕 ad revenue cohort
+    "ad_revenue_d0", "ad_revenue_d1", "ad_revenue_d7", "ad_revenue_d30",
+    # 🆕 engagement
+    "sessions_per_user", "time_spent", "engagement_rate",
+    # 🆕 attribution breakdown
+    "attribution_impressions", "attribution_clicks", "attribution_unknown",
+    "network_installs", "network_clicks", "network_impressions",
+    # 🆕 SKAdNetwork (iOS 14+ attribution)
+    "skad_installs", "skad_total_installs", "skad_qualifier_installs",
+    "skad_revenue", "skad_roas",
 ]
 
 # Ye INTEGER hain; baqi sab FLOAT (rates/revenue/cost)
@@ -179,6 +218,12 @@ INT_METRICS = {
     "daus", "waus", "maus", "revenue_events",
     "events", "first_events", "all_events",
     "retained_users_d1", "retained_users_d7", "retained_users_d30",
+    # 🆕 v2.1
+    "retained_users_d0", "retained_users_d3", "retained_users_d14",
+    "retained_users_d60", "retained_users_d90",
+    "attribution_impressions", "attribution_clicks", "attribution_unknown",
+    "network_installs", "network_clicks", "network_impressions",
+    "skad_installs", "skad_total_installs", "skad_qualifier_installs",
 }
 
 # ── TEEN REPORT ────────────────────────────────────────────────────────────
@@ -206,6 +251,23 @@ REPORTS = [
                        "country", "country_code", "device_type"],
         "cluster":    ["app_token", "country_code"],
         "desc":       "geo/device breakdown",
+    },
+    # ── 🆕 v2.1 ──
+    {
+        "key":        "cohort",
+        "table":      "cohort_daily_performance",
+        "dimensions": ["day", "app", "app_token", "os_name",
+                       "partner_name", "campaign", "country_code", "period"],
+        "cluster":    ["app_token", "partner_name", "period"],
+        "desc":       "🔑 ASLI COHORT — har period ki apni row (d0/d1/d7/d30...)",
+    },
+    {
+        "key":        "event",
+        "table":      "event_daily_performance",
+        "dimensions": ["day", "app", "app_token", "os_name",
+                       "partner_name", "campaign", "event", "event_name"],
+        "cluster":    ["app_token", "event_name"],
+        "desc":       "har custom event alag — purchase / level / tutorial",
     },
 ]
 
@@ -401,6 +463,7 @@ def _probe_one(dims, mets, token, period, label):
         "metrics":          ",".join(mets),
         "utc_offset":       UTC_OFFSET,
         "attribution_type": ATTRIBUTION_TYPE,
+        "cohort_maturity":  COHORT_MATURITY,      # 🆕 v2.1
     }, label, quiet=True)
     if body is None:
         return False, [err]
@@ -490,6 +553,12 @@ def build_schema(dimensions, metrics):
     for d in dimensions:
         if d == "day":
             fields.append(bigquery.SchemaField("date", "DATE", mode="REQUIRED"))
+        elif d == "app_token":
+            # 🔧 v2.1 FIX — app_token LAZMI hai: DELETE guard isi par chalta hai,
+            #    aur maujooda tables mein ye REQUIRED bana hua hai. NULLABLE
+            #    chhodne se BigQuery 400 deta hai:
+            #      "Field app_token has changed mode from REQUIRED to NULLABLE"
+            fields.append(bigquery.SchemaField("app_token", "STRING", mode="REQUIRED"))
         else:
             fields.append(bigquery.SchemaField(d, "STRING"))
 
@@ -564,6 +633,7 @@ def fetch_chunk(report, tokens, start, end, dimensions, metrics, label):
         "metrics":          ",".join(metrics),
         "utc_offset":       UTC_OFFSET,
         "attribution_type": ATTRIBUTION_TYPE,
+        "cohort_maturity":  COHORT_MATURITY,      # 🆕 v2.1
     }, label)
 
     if body is None:
