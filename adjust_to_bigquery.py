@@ -133,6 +133,7 @@ CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "25"))
 METRIC_BATCH_SIZE = int(os.environ.get("METRIC_BATCH_SIZE", "35"))
 MAX_WORKERS = max(1, int(os.environ.get("MAX_WORKERS", "6")))
 MAX_HTTP_IN_FLIGHT = max(1, int(os.environ.get("MAX_HTTP_IN_FLIGHT", str(MAX_WORKERS))))
+PERSIST_CATALOGS = os.environ.get("PERSIST_CATALOGS", "1") == "1"
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "6"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "300"))
 UTC_OFFSET = os.environ.get("UTC_OFFSET", "+00:00").strip()
@@ -1576,8 +1577,8 @@ def run_event_cohort(client: bigquery.Client | None, tokens: list[str], start: d
 # Main
 # -----------------------------------------------------------------------------
 def main() -> None:
-    log.info("🚀 Adjust -> BigQuery v3.1 PARALLEL COMPLETE REPORTING WAREHOUSE")
-    log.info("Workers: %d | max Adjust HTTP in-flight: %d", MAX_WORKERS, MAX_HTTP_IN_FLIGHT)
+    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT COMPLETE REPORTING WAREHOUSE")
+    log.info("Workers: %d | max Adjust HTTP in-flight: %d | persist_catalogs=%s", MAX_WORKERS, MAX_HTTP_IN_FLIGHT, PERSIST_CATALOGS)
     for name, value in (
         ("ADJUST_API_TOKEN", ADJUST_API_TOKEN),
         ("GCP_PROJECT", GCP_PROJECT),
@@ -1594,7 +1595,8 @@ def main() -> None:
 
     tokens = load_app_tokens()
     filters = discover_filters()
-    events = discover_events(tokens)
+    need_events = any(r in ENABLED_REPORTS for r in ("event", "event_cohort")) or PERSIST_CATALOGS
+    events = discover_events(tokens) if need_events else []
     all_periods = discovered_periods(filters)
     cohort_periods = select_periods(COHORT_PERIODS_SETTING, all_periods)
     event_periods = select_periods(EVENT_COHORT_PERIODS_SETTING, all_periods)
@@ -1622,7 +1624,7 @@ def main() -> None:
     log.info("Reports: %s", ",".join(ENABLED_REPORTS))
 
     client = None if DRY_RUN else get_bq_client()
-    if client:
+    if client and PERSIST_CATALOGS:
         persist_catalogs(client, filters, events, all_periods)
 
     # Base reports
