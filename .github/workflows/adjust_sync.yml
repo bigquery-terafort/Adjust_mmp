@@ -199,6 +199,14 @@ jobs:
           echo "Before: ${ROWS:-0} rows; latest date ${LAST:-none}"
           exit 0
 
+      - name: Verify v3 loader
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f adjust_to_bigquery.py || { echo "::error::adjust_to_bigquery.py is missing from repository root"; ls -la; exit 1; }
+          python -m py_compile adjust_to_bigquery.py
+          echo "✅ adjust_to_bigquery.py exists and compiles"
+
       - name: Run Adjust → BigQuery v3
         env:
           # Secrets
@@ -243,7 +251,7 @@ jobs:
           UTC_OFFSET: '+00:00'
           DRY_RUN: ${{ steps.profile.outputs.dry_run }}
 
-        run: python adjust_to_bigquery_v3.py
+        run: python adjust_to_bigquery.py
 
       # v3 replaces production windows transactionally. Row counts can
       # legitimately decrease because corrected/zero Adjust responses clear
