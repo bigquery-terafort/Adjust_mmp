@@ -64,6 +64,8 @@ LOOKBACK_DAYS=14
 COHORT_LOOKBACK_DAYS=150
 CHUNK_SIZE=25
 METRIC_BATCH_SIZE=35
+MAX_WORKERS=6                       # bounded Adjust/API concurrency
+MAX_HTTP_IN_FLIGHT=6                # hard cap across all worker pools
 MAX_RETRIES=6
 REQUEST_TIMEOUT=300
 UTC_OFFSET=+00:00
@@ -89,10 +91,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
 import sys
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
@@ -126,6 +131,8 @@ LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "14"))
 COHORT_LOOKBACK_DAYS = int(os.environ.get("COHORT_LOOKBACK_DAYS", "150"))
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "25"))
 METRIC_BATCH_SIZE = int(os.environ.get("METRIC_BATCH_SIZE", "35"))
+MAX_WORKERS = max(1, int(os.environ.get("MAX_WORKERS", "6")))
+MAX_HTTP_IN_FLIGHT = max(1, int(os.environ.get("MAX_HTTP_IN_FLIGHT", str(MAX_WORKERS))))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "6"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "300"))
 UTC_OFFSET = os.environ.get("UTC_OFFSET", "+00:00").strip()
@@ -157,6 +164,33 @@ FAILURES: list[str] = []
 
 SENTINELS = {"unknown", "missing", "n/a", "na", "-", "none", "null", ""}
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+
+# Bounded concurrency. Multiple report/event worker pools may exist at once, but
+# this semaphore guarantees that the process never has more than
+# MAX_HTTP_IN_FLIGHT live Adjust HTTP requests.
+_HTTP_GATE = threading.BoundedSemaphore(MAX_HTTP_IN_FLIGHT)
+_THREAD_LOCAL = threading.local()
+_NEG_CACHE_LOCK = threading.Lock()
+_FAILURE_LOCK = threading.Lock()
+
+def worker_count(items: int) -> int:
+    return max(1, min(MAX_WORKERS, items))
+
+def get_http_session() -> requests.Session:
+    """One requests.Session per worker thread for keep-alive connection reuse."""
+    session = getattr(_THREAD_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update(request_headers())
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=MAX_HTTP_IN_FLIGHT,
+            pool_maxsize=MAX_HTTP_IN_FLIGHT,
+            max_retries=0,
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _THREAD_LOCAL.session = session
+    return session
 
 # -----------------------------------------------------------------------------
 # Report definitions
@@ -389,7 +423,8 @@ EVENT_COHORT_FAMILIES: dict[str, str] = {
 # -----------------------------------------------------------------------------
 def record_failure(where: str, detail: Any) -> None:
     msg = f"{where}: {detail}"
-    FAILURES.append(msg)
+    with _FAILURE_LOCK:
+        FAILURES.append(msg)
     log.error("❌ %s", msg)
 
 
@@ -487,7 +522,9 @@ def http_get_json(url: str, params: dict[str, Any], label: str, quiet: bool = Fa
     """Return (json_body, error). 204 is a successful empty response."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            r = requests.get(url, headers=request_headers(), params=params, timeout=REQUEST_TIMEOUT)
+            # Acquire only for the actual network call; retries sleep outside the gate.
+            with _HTTP_GATE:
+                r = get_http_session().get(url, params=params, timeout=REQUEST_TIMEOUT)
             if r.status_code == 204:
                 return {}, ""
             body: Any = None
@@ -511,6 +548,7 @@ def http_get_json(url: str, params: dict[str, Any], label: str, quiet: bool = Fa
             if r.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
                 retry_after = r.headers.get("Retry-After")
                 wait = int(retry_after) if retry_after and retry_after.isdigit() else min(5 * (2 ** (attempt - 1)), 120)
+                wait += random.uniform(0.0, min(2.0, wait * 0.15))
                 if not quiet:
                     log.warning("%s HTTP %s; retry %d/%d in %ss", label, r.status_code, attempt, MAX_RETRIES, wait)
                 time.sleep(wait)
@@ -518,7 +556,7 @@ def http_get_json(url: str, params: dict[str, Any], label: str, quiet: bool = Fa
             return None, f"HTTP {r.status_code}: {detail}"
         except requests.exceptions.RequestException as exc:
             if attempt < MAX_RETRIES:
-                wait = min(5 * (2 ** (attempt - 1)), 120)
+                wait = min(5 * (2 ** (attempt - 1)), 120) + random.uniform(0.0, 1.5)
                 if not quiet:
                     log.warning("%s network error; retry %d/%d in %ss: %s", label, attempt, MAX_RETRIES, wait, exc)
                 time.sleep(wait)
@@ -680,25 +718,48 @@ def warnings_are_problem(warnings: list[str]) -> bool:
 
 
 def negotiate_dimensions(dimensions: list[str], token: str, sample_start: date, sample_end: date) -> list[str]:
-    key = tuple(dimensions)
-    if key in _NEG_DIM_CACHE:
-        return _NEG_DIM_CACHE[key]
+    original_key = tuple(dimensions)
+    with _NEG_CACHE_LOCK:
+        cached = _NEG_DIM_CACHE.get(original_key)
+    if cached is not None:
+        return cached
+
     if "day" not in dimensions:
         dimensions = ["day"] + dimensions
+    to_probe = [d for d in dimensions if d != "day"]
+
+    def probe_dim(d: str) -> tuple[str, bool, str, list[str]]:
+        rows, err, warns = report_call(
+            [token], sample_start, sample_end, ["day", d], ["installs"],
+            f"probe_dim:{d}", quiet=True,
+        )
+        ok = rows is not None and not warnings_are_problem(warns)
+        return d, ok, err, warns
+
+    results: dict[str, tuple[bool, str, list[str]]] = {}
+    if to_probe:
+        with ThreadPoolExecutor(max_workers=worker_count(len(to_probe)), thread_name_prefix="adjust-dim") as pool:
+            future_map = {pool.submit(probe_dim, d): d for d in to_probe}
+            for fut in as_completed(future_map):
+                d = future_map[fut]
+                try:
+                    _, ok, err, warns = fut.result()
+                except Exception as exc:
+                    ok, err, warns = False, str(exc), []
+                results[d] = (ok, err, warns)
+
     good = ["day"]
-    for d in dimensions:
-        if d == "day":
-            continue
-        rows, err, warns = report_call([token], sample_start, sample_end, ["day", d], ["installs"], f"probe_dim:{d}", quiet=True)
-        if rows is not None and not warnings_are_problem(warns):
+    for d in to_probe:
+        ok, err, warns = results.get(d, (False, "probe missing", []))
+        if ok:
             good.append(d)
         else:
             log.warning("Dimension not usable: %s (%s %s)", d, err, warns[:1])
-        time.sleep(0.08)
-    # app_token is required for safe warehouse replacement. If unavailable, abort.
+
     if "app_token" in dimensions and "app_token" not in good:
         die("Adjust did not accept app_token dimension; cannot safely scope BigQuery replacement")
-    _NEG_DIM_CACHE[key] = good
+    with _NEG_CACHE_LOCK:
+        _NEG_DIM_CACHE[original_key] = good
     return good
 
 
@@ -716,34 +777,49 @@ def metric_batch_supported(dimensions: list[str], metrics: list[str], token: str
 def negotiate_metrics(dimensions: list[str], candidates: list[str], token: str,
                       sample_start: date, sample_end: date, *,
                       ad_spend_mode: str, cohort_maturity: str | None) -> list[str]:
-    # Cache only on the exact candidate universe/config.
-    ck = (tuple(dimensions), tuple(candidates), ad_spend_mode or "", cohort_maturity or "")
-    if ck in _NEG_METRIC_CACHE:
-        return _NEG_METRIC_CACHE[ck]
+    unique_candidates = list(dict.fromkeys(candidates))
+    ck = (tuple(dimensions), tuple(unique_candidates), ad_spend_mode or "", cohort_maturity or "")
+    with _NEG_CACHE_LOCK:
+        cached = _NEG_METRIC_CACHE.get(ck)
+    if cached is not None:
+        return cached
 
     def split_probe(items: list[str]) -> list[str]:
         if not items:
             return []
-        if metric_batch_supported(dimensions, items, token, sample_start, sample_end,
-                                  ad_spend_mode=ad_spend_mode, cohort_maturity=cohort_maturity):
+        if metric_batch_supported(
+            dimensions, items, token, sample_start, sample_end,
+            ad_spend_mode=ad_spend_mode, cohort_maturity=cohort_maturity,
+        ):
             return items
         if len(items) == 1:
             return []
         mid = len(items) // 2
+        # Recursion stays inside this worker; only top-level metric batches fan out.
         return split_probe(items[:mid]) + split_probe(items[mid:])
 
-    supported: list[str] = []
-    for batch in chunked(list(dict.fromkeys(candidates)), METRIC_BATCH_SIZE):
-        supported.extend(split_probe(batch))
-        time.sleep(0.1)
-    supported = list(dict.fromkeys(supported))
-    dropped = [m for m in candidates if m not in set(supported)]
-    log.info("Metrics supported %d/%d", len(supported), len(candidates))
+    batches = list(chunked(unique_candidates, METRIC_BATCH_SIZE))
+    found: set[str] = set()
+    if batches:
+        with ThreadPoolExecutor(max_workers=worker_count(len(batches)), thread_name_prefix="adjust-metric") as pool:
+            future_map = {pool.submit(split_probe, batch): i for i, batch in enumerate(batches)}
+            for fut in as_completed(future_map):
+                try:
+                    found.update(fut.result())
+                except Exception as exc:
+                    log.warning("Metric negotiation batch failed: %s", exc)
+
+    # Preserve Adjust candidate order for stable schemas/logging.
+    supported = [m for m in unique_candidates if m in found]
+    dropped = [m for m in unique_candidates if m not in found]
+    log.info("Metrics supported %d/%d", len(supported), len(unique_candidates))
     if dropped:
         log.info("Unsupported/plan-gated metric candidates (%d): %s%s",
                  len(dropped), ", ".join(dropped[:30]), " ..." if len(dropped) > 30 else "")
-    _NEG_METRIC_CACHE[ck] = supported
+    with _NEG_CACHE_LOCK:
+        _NEG_METRIC_CACHE[ck] = supported
     return supported
+
 
 # -----------------------------------------------------------------------------
 # Fetch + merge metric chunks
@@ -1108,6 +1184,36 @@ def persist_catalogs(client: bigquery.Client, filters: dict[str, list[dict[str, 
     ])
 
 # -----------------------------------------------------------------------------
+# Parallel fetch helpers
+# -----------------------------------------------------------------------------
+def fetch_app_chunks_parallel(tokens: list[str], start: date, end: date, dimensions: list[str],
+                              metrics: list[str], label_prefix: str, *, ad_spend_mode: str,
+                              cohort_maturity: str | None = None):
+    """Fetch app-token chunks concurrently. Returns [(chunk_index, chunk, rows)]."""
+    chunks = list(chunked(tokens, CHUNK_SIZE))
+    if not chunks:
+        return []
+
+    def do_one(ci: int, app_chunk: list[str]):
+        rows = fetch_merged(
+            app_chunk, start, end, dimensions, metrics,
+            f"{label_prefix}:chunk{ci}",
+            ad_spend_mode=ad_spend_mode, cohort_maturity=cohort_maturity,
+        )
+        return ci, app_chunk, rows
+
+    results = []
+    with ThreadPoolExecutor(max_workers=worker_count(len(chunks)), thread_name_prefix="adjust-chunk") as pool:
+        futures = [pool.submit(do_one, ci, app_chunk) for ci, app_chunk in enumerate(chunks, 1)]
+        for fut in as_completed(futures):
+            try:
+                results.append(fut.result())
+            except Exception as exc:
+                log.exception("%s worker crashed: %s", label_prefix, exc)
+                results.append((-1, [], None))
+    return sorted(results, key=lambda x: x[0])
+
+# -----------------------------------------------------------------------------
 # Base reports
 # -----------------------------------------------------------------------------
 def run_flat_report(client: bigquery.Client | None, report_key: str, tokens: list[str], start: date, end: date,
@@ -1126,9 +1232,9 @@ def run_flat_report(client: bigquery.Client | None, report_key: str, tokens: lis
         supported = negotiate_metrics(dims, candidates, tokens[0], sample_start, sample_end,
                                       ad_spend_mode=mode, cohort_maturity=None)
         union_metrics.extend(supported)
-        for ci, app_chunk in enumerate(chunked(tokens, CHUNK_SIZE), 1):
-            raw = fetch_merged(app_chunk, start, end, dims, supported,
-                               f"{report_key}:{mode}:chunk{ci}", ad_spend_mode=mode)
+        for ci, app_chunk, raw in fetch_app_chunks_parallel(
+                tokens, start, end, dims, supported, f"{report_key}:{mode}",
+                ad_spend_mode=mode):
             if raw is None:
                 record_failure(f"{report_key}:{mode}:chunk{ci}", "fetch failed")
                 continue
@@ -1220,10 +1326,9 @@ def run_cohort_report(client: bigquery.Client | None, tokens: list[str], start: 
         if not supported:
             log.warning("No cohort metrics supported for maturity=%s", maturity)
             continue
-        for ci, app_chunk in enumerate(chunked(tokens, CHUNK_SIZE), 1):
-            raw = fetch_merged(app_chunk, start, end, dims, supported,
-                               f"cohort:{maturity}:chunk{ci}", ad_spend_mode=AD_SPEND_MODE,
-                               cohort_maturity=maturity)
+        for ci, app_chunk, raw in fetch_app_chunks_parallel(
+                tokens, start, end, dims, supported, f"cohort:{maturity}",
+                ad_spend_mode=AD_SPEND_MODE, cohort_maturity=maturity):
             if raw is None:
                 record_failure(f"cohort:{maturity}:chunk{ci}", "fetch failed")
                 continue
@@ -1264,21 +1369,56 @@ def run_event_daily(client: bigquery.Client | None, tokens: list[str], start: da
     ok_tokens: set[str] = set()
     now = datetime.now(timezone.utc).isoformat()
 
-    for ev_i, ev in enumerate(events, 1):
+    def prepare_event(ev: dict[str, Any]):
         slug = _clean(ev.get("id"))
         if not slug:
-            continue
+            return None
         metric = f"{slug}_events"
         eligible_tokens = [t for t in tokens if event_applies_to_token(ev, t)]
         if not eligible_tokens:
-            continue
-        supported = negotiate_metrics(dims, [metric], eligible_tokens[0], sample_start, sample_end,
-                                      ad_spend_mode=AD_SPEND_MODE, cohort_maturity=None)
+            return None
+        supported = negotiate_metrics(
+            dims, [metric], eligible_tokens[0], sample_start, sample_end,
+            ad_spend_mode=AD_SPEND_MODE, cohort_maturity=None,
+        )
         if not supported:
-            continue
+            return None
+        return ev, slug, metric, eligible_tokens
+
+    prepared = []
+    with ThreadPoolExecutor(max_workers=worker_count(len(events)), thread_name_prefix="adjust-event-probe") as pool:
+        futures = [pool.submit(prepare_event, ev) for ev in events]
+        for fut in as_completed(futures):
+            try:
+                item = fut.result()
+                if item is not None:
+                    prepared.append(item)
+            except Exception as exc:
+                log.warning("Event preparation failed: %s", exc)
+
+    jobs = []
+    for ev, slug, metric, eligible_tokens in prepared:
         for ci, app_chunk in enumerate(chunked(eligible_tokens, CHUNK_SIZE), 1):
-            raw = fetch_merged(app_chunk, start, end, dims, supported,
-                               f"event:{slug}:chunk{ci}", ad_spend_mode=AD_SPEND_MODE)
+            jobs.append((ev, slug, metric, ci, app_chunk))
+
+    def fetch_event_job(job):
+        ev, slug, metric, ci, app_chunk = job
+        raw = fetch_merged(
+            app_chunk, start, end, dims, [metric],
+            f"event:{slug}:chunk{ci}", ad_spend_mode=AD_SPEND_MODE,
+        )
+        return ev, slug, metric, ci, app_chunk, raw
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=worker_count(len(jobs)), thread_name_prefix="adjust-event") as pool:
+        futures = [pool.submit(fetch_event_job, job) for job in jobs]
+        for fut in as_completed(futures):
+            completed += 1
+            try:
+                ev, slug, metric, ci, app_chunk, raw = fut.result()
+            except Exception as exc:
+                record_failure("event_worker", exc)
+                continue
             if raw is None:
                 record_failure(f"event:{slug}:chunk{ci}", "fetch failed")
                 continue
@@ -1302,8 +1442,8 @@ def run_event_daily(client: bigquery.Client | None, tokens: list[str], start: da
                 })
                 all_rows.append(rec)
             ok_tokens.update(app_chunk)
-        if ev_i % 25 == 0:
-            log.info("Event daily progress %d/%d", ev_i, len(events))
+            if completed % 50 == 0:
+                log.info("Event daily fetch progress %d/%d", completed, len(jobs))
 
     if DRY_RUN:
         log.info("[DRY] event_daily rows=%d events=%d", len(all_rows), len(events))
@@ -1333,29 +1473,63 @@ def run_event_cohort(client: bigquery.Client | None, tokens: list[str], start: d
     now = datetime.now(timezone.utc).isoformat()
 
     for maturity in COHORT_MATURITIES:
-        for ev_i, ev in enumerate(events, 1):
+        def prepare_event(ev: dict[str, Any]):
             slug = _clean(ev.get("id"))
             if not slug:
-                continue
+                return None
             eligible_tokens = [t for t in tokens if event_applies_to_token(ev, t)]
             if not eligible_tokens:
-                continue
+                return None
             metric_map = build_event_cohort_metric_map(slug, periods)
             candidates = list(metric_map.keys())
-            supported = negotiate_metrics(dims, candidates, eligible_tokens[0], sample_start, sample_end,
-                                          ad_spend_mode=AD_SPEND_MODE, cohort_maturity=maturity)
+            supported = negotiate_metrics(
+                dims, candidates, eligible_tokens[0], sample_start, sample_end,
+                ad_spend_mode=AD_SPEND_MODE, cohort_maturity=maturity,
+            )
             if not supported:
-                continue
+                return None
             supported_set = set(supported)
             by_period: dict[str, list[tuple[str, str]]] = defaultdict(list)
             for metric_slug, (p, field) in metric_map.items():
                 if metric_slug in supported_set:
                     by_period[p].append((metric_slug, field))
+            return ev, slug, eligible_tokens, supported, by_period
 
+        prepared = []
+        with ThreadPoolExecutor(max_workers=worker_count(len(events)), thread_name_prefix="adjust-eventcohort-probe") as pool:
+            futures = [pool.submit(prepare_event, ev) for ev in events]
+            for fut in as_completed(futures):
+                try:
+                    item = fut.result()
+                    if item is not None:
+                        prepared.append(item)
+                except Exception as exc:
+                    log.warning("Event cohort preparation [%s] failed: %s", maturity, exc)
+
+        jobs = []
+        for ev, slug, eligible_tokens, supported, by_period in prepared:
             for ci, app_chunk in enumerate(chunked(eligible_tokens, CHUNK_SIZE), 1):
-                raw = fetch_merged(app_chunk, start, end, dims, supported,
-                                   f"event_cohort:{maturity}:{slug}:chunk{ci}",
-                                   ad_spend_mode=AD_SPEND_MODE, cohort_maturity=maturity)
+                jobs.append((ev, slug, supported, by_period, ci, app_chunk))
+
+        def fetch_event_cohort_job(job):
+            ev, slug, supported, by_period, ci, app_chunk = job
+            raw = fetch_merged(
+                app_chunk, start, end, dims, supported,
+                f"event_cohort:{maturity}:{slug}:chunk{ci}",
+                ad_spend_mode=AD_SPEND_MODE, cohort_maturity=maturity,
+            )
+            return ev, slug, supported, by_period, ci, app_chunk, raw
+
+        completed = 0
+        with ThreadPoolExecutor(max_workers=worker_count(len(jobs)), thread_name_prefix="adjust-eventcohort") as pool:
+            futures = [pool.submit(fetch_event_cohort_job, job) for job in jobs]
+            for fut in as_completed(futures):
+                completed += 1
+                try:
+                    ev, slug, supported, by_period, ci, app_chunk, raw = fut.result()
+                except Exception as exc:
+                    record_failure(f"event_cohort:{maturity}:worker", exc)
+                    continue
                 if raw is None:
                     record_failure(f"event_cohort:{maturity}:{slug}:chunk{ci}", "fetch failed")
                     continue
@@ -1387,8 +1561,8 @@ def run_event_cohort(client: bigquery.Client | None, tokens: list[str], start: d
                         rec["_run_id"] = RUN_ID
                         all_rows.append(rec)
                 ok_tokens.update(app_chunk)
-            if ev_i % 10 == 0:
-                log.info("Event cohort [%s] progress %d/%d", maturity, ev_i, len(events))
+                if completed % 50 == 0:
+                    log.info("Event cohort [%s] fetch progress %d/%d", maturity, completed, len(jobs))
 
     if DRY_RUN:
         log.info("[DRY] event_cohort rows=%d events=%d periods=%d", len(all_rows), len(events), len(periods))
@@ -1397,11 +1571,13 @@ def run_event_cohort(client: bigquery.Client | None, tokens: list[str], start: d
     atomic_replace_window(client, "event_cohort_daily_performance", all_rows, schema, ok_tokens, start, end,
                           cluster=["app_token", "event_slug", "cohort_period", "campaign_id_network"])
 
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 def main() -> None:
-    log.info("🚀 Adjust -> BigQuery v3.0 COMPLETE REPORTING WAREHOUSE")
+    log.info("🚀 Adjust -> BigQuery v3.1 PARALLEL COMPLETE REPORTING WAREHOUSE")
+    log.info("Workers: %d | max Adjust HTTP in-flight: %d", MAX_WORKERS, MAX_HTTP_IN_FLIGHT)
     for name, value in (
         ("ADJUST_API_TOKEN", ADJUST_API_TOKEN),
         ("GCP_PROJECT", GCP_PROJECT),
