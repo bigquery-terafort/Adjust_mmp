@@ -1,22 +1,10 @@
-name: Adjust → BigQuery Sync (v3 — complete reporting)
-
-# v3 strategy
-# - Mon-Sat: normal daily refresh (D0-D120 general cohorts, key event-cohort days)
-# - Sunday: deep refresh (all cohort periods + all D0-D120 event-cohort days)
-# - Manual: choose windows/periods and optional backfill dates
-#
-# Required repository secrets:
-#   ADJUST_API_TOKEN
-#   GCP_PROJECT
-#   GCP_CREDENTIALS_JSON
-# Optional if app_tokens.txt is committed:
-#   ADJUST_APP_TOKENS
+name: Adjust → BigQuery Sync (v3.2 — parallel reports)
 
 on:
   schedule:
-    # Normal daily refresh, Mon-Sat. 02:17 UTC = 07:17 Pakistan time.
+    # Daily refresh Mon-Sat
     - cron: '17 2 * * 1-6'
-    # Weekly deep refresh on Sunday. Avoids running both normal + deep on Sunday.
+    # Weekly deep refresh Sunday
     - cron: '47 3 * * 0'
 
   workflow_dispatch:
@@ -26,7 +14,7 @@ on:
         required: false
         default: '14'
       cohort_lookback_days:
-        description: 'Cohort install-date rolling window (>=121 recommended)'
+        description: 'Cohort rolling window (days)'
         required: false
         default: '150'
       chunk_size:
@@ -34,102 +22,91 @@ on:
         required: false
         default: '25'
       metric_batch_size:
-        description: 'Metrics per negotiation/fetch batch'
+        description: 'Metrics per Adjust request batch'
         required: false
         default: '35'
       reports:
-        description: 'Reports to run (comma-separated)'
+        description: 'Comma-separated: app,campaign,country,spend,cohort,event,event_cohort'
         required: false
-        default: 'app,campaign,country,cohort,event,event_cohort,spend'
+        default: 'app,campaign,country,spend,cohort,event,event_cohort'
       cohort_periods:
-        description: 'all_days | all_periods | key | comma list (d0,d1,d7...)'
+        description: 'all_days | all_periods | key | comma list'
         required: false
         default: 'all_days'
       event_cohort_periods:
-        description: 'key | all_days | comma list (d0,d1,d7...)'
+        description: 'key | all_days | comma list'
         required: false
         default: 'key'
       include_weekly_monthly_cohorts:
-        description: '1 = include W0-W52 and M0-M36 when available'
+        description: '1 = include weekly/monthly cohort periods'
         required: false
         default: '0'
       start_date:
-        description: 'Optional backfill start YYYY-MM-DD'
+        description: 'Optional YYYY-MM-DD backfill start'
         required: false
         default: ''
       end_date:
-        description: 'Optional backfill end YYYY-MM-DD'
+        description: 'Optional YYYY-MM-DD backfill end'
         required: false
         default: ''
       dry_run:
-        description: '1 = fetch/validate only; do not write BigQuery'
+        description: '1 = no BigQuery writes'
         required: false
         default: '0'
 
 concurrency:
-  group: adjust-bigquery-sync-v3
+  group: adjust-bigquery-sync-v32
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  sync:
-    name: Sync Adjust → BigQuery v3
+  prepare:
+    name: Build Adjust run profile
     runs-on: ubuntu-latest
-    timeout-minutes: 300
-
-    env:
-      GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
-      BQ_DATASET: adjust_data
-      BQ_LOCATION: US
-
+    outputs:
+      matrix: ${{ steps.profile.outputs.matrix }}
+      lookback: ${{ steps.profile.outputs.lookback }}
+      cohort_lookback: ${{ steps.profile.outputs.cohort_lookback }}
+      chunk: ${{ steps.profile.outputs.chunk }}
+      metric_batch: ${{ steps.profile.outputs.metric_batch }}
+      cohort_periods: ${{ steps.profile.outputs.cohort_periods }}
+      event_periods: ${{ steps.profile.outputs.event_periods }}
+      include_wm: ${{ steps.profile.outputs.include_wm }}
+      start_date: ${{ steps.profile.outputs.start_date }}
+      end_date: ${{ steps.profile.outputs.end_date }}
+      dry_run: ${{ steps.profile.outputs.dry_run }}
+      profile: ${{ steps.profile.outputs.profile }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: pip
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_CREDENTIALS_JSON }}
-
-      - name: Set up gcloud / bq
-        uses: google-github-actions/setup-gcloud@v2
-
-      - name: Install dependencies
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      # Decide normal vs deep scheduled profile. Manual runs keep the values
-      # supplied in workflow_dispatch.
-      - name: Build run profile
+      - name: Build profile + report matrix
         id: profile
         shell: bash
+        env:
+          INPUT_LOOKBACK: ${{ inputs.lookback_days || '14' }}
+          INPUT_COHORT_LOOKBACK: ${{ inputs.cohort_lookback_days || '150' }}
+          INPUT_CHUNK: ${{ inputs.chunk_size || '25' }}
+          INPUT_METRIC_BATCH: ${{ inputs.metric_batch_size || '35' }}
+          INPUT_REPORTS: ${{ inputs.reports || 'app,campaign,country,spend,cohort,event,event_cohort' }}
+          INPUT_COHORT_PERIODS: ${{ inputs.cohort_periods || 'all_days' }}
+          INPUT_EVENT_PERIODS: ${{ inputs.event_cohort_periods || 'key' }}
+          INPUT_INCLUDE_WM: ${{ inputs.include_weekly_monthly_cohorts || '0' }}
+          INPUT_START_DATE: ${{ inputs.start_date || '' }}
+          INPUT_END_DATE: ${{ inputs.end_date || '' }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run || '0' }}
         run: |
           set -euo pipefail
 
-          LOOKBACK='${{ inputs.lookback_days || '14' }}'
-          COHORT_LOOKBACK='${{ inputs.cohort_lookback_days || '150' }}'
-          CHUNK='${{ inputs.chunk_size || '25' }}'
-          METRIC_BATCH='${{ inputs.metric_batch_size || '35' }}'
-          REPORTS='${{ inputs.reports || 'app,campaign,country,cohort,event,event_cohort,spend' }}'
-          COHORT_PERIODS='${{ inputs.cohort_periods || 'all_days' }}'
-          EVENT_PERIODS='${{ inputs.event_cohort_periods || 'key' }}'
-          INCLUDE_WM='${{ inputs.include_weekly_monthly_cohorts || '0' }}'
-          START_DATE='${{ inputs.start_date || '' }}'
-          END_DATE='${{ inputs.end_date || '' }}'
-          DRY_RUN='${{ inputs.dry_run || '0' }}'
           PROFILE='manual'
+          LOOKBACK="$INPUT_LOOKBACK"
+          COHORT_LOOKBACK="$INPUT_COHORT_LOOKBACK"
+          REPORTS="$INPUT_REPORTS"
+          COHORT_PERIODS="$INPUT_COHORT_PERIODS"
+          EVENT_PERIODS="$INPUT_EVENT_PERIODS"
+          INCLUDE_WM="$INPUT_INCLUDE_WM"
 
           if [[ '${{ github.event_name }}' == 'schedule' ]]; then
+            REPORTS='app,campaign,country,spend,cohort,event,event_cohort'
             if [[ '${{ github.event.schedule }}' == '47 3 * * 0' ]]; then
               PROFILE='weekly-deep'
               LOOKBACK='30'
@@ -147,202 +124,147 @@ jobs:
             fi
           fi
 
-          # Self-heal flat window if app_daily_performance is stale. Never skip
-          # just because yesterday already exists: Adjust revises cost,
-          # attribution and cohort values after first ingestion.
-          LAST=$(bq query --nouse_legacy_sql --format=csv --quiet \
-            "SELECT CAST(MAX(date) AS STRING) FROM \`${GCP_PROJECT}.${BQ_DATASET}.app_daily_performance\`" \
-            2>/dev/null | tail -1 || true)
+          MATRIX=$(REPORTS="$REPORTS" python - <<'PY'
+          import json, os
+          allowed = ['app','campaign','country','spend','cohort','event','event_cohort']
+          requested = {x.strip() for x in os.environ['REPORTS'].split(',') if x.strip()}
+          selected = [x for x in allowed if x in requested]
+          if not selected:
+              raise SystemExit('No valid reports selected')
+          print(json.dumps({'report': selected}, separators=(',', ':')))
+          PY
+          )
 
-          if [[ "$LAST" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && [[ -z "$START_DATE" ]]; then
-            GAP=$(( ( $(date -u +%s) - $(date -u -d "$LAST" +%s) ) / 86400 ))
-            if (( GAP > LOOKBACK )); then
-              LOOKBACK=$(( GAP + 3 ))
-              (( LOOKBACK > 180 )) && LOOKBACK=180
-              echo "::warning::Self-heal: latest app data is ${GAP} days old; flat lookback raised to ${LOOKBACK}."
-            fi
-          fi
-
-          echo "profile=$PROFILE" >> "$GITHUB_OUTPUT"
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
           echo "lookback=$LOOKBACK" >> "$GITHUB_OUTPUT"
           echo "cohort_lookback=$COHORT_LOOKBACK" >> "$GITHUB_OUTPUT"
-          echo "chunk=$CHUNK" >> "$GITHUB_OUTPUT"
-          echo "metric_batch=$METRIC_BATCH" >> "$GITHUB_OUTPUT"
-          echo "reports=$REPORTS" >> "$GITHUB_OUTPUT"
+          echo "chunk=$INPUT_CHUNK" >> "$GITHUB_OUTPUT"
+          echo "metric_batch=$INPUT_METRIC_BATCH" >> "$GITHUB_OUTPUT"
           echo "cohort_periods=$COHORT_PERIODS" >> "$GITHUB_OUTPUT"
           echo "event_periods=$EVENT_PERIODS" >> "$GITHUB_OUTPUT"
           echo "include_wm=$INCLUDE_WM" >> "$GITHUB_OUTPUT"
-          echo "start_date=$START_DATE" >> "$GITHUB_OUTPUT"
-          echo "end_date=$END_DATE" >> "$GITHUB_OUTPUT"
-          echo "dry_run=$DRY_RUN" >> "$GITHUB_OUTPUT"
+          echo "start_date=$INPUT_START_DATE" >> "$GITHUB_OUTPUT"
+          echo "end_date=$INPUT_END_DATE" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$INPUT_DRY_RUN" >> "$GITHUB_OUTPUT"
+          echo "profile=$PROFILE" >> "$GITHUB_OUTPUT"
 
           echo "Profile: $PROFILE"
-          echo "Flat lookback: $LOOKBACK days"
-          echo "Cohort lookback: $COHORT_LOOKBACK days"
-          echo "Reports: $REPORTS"
-          echo "Cohort periods: $COHORT_PERIODS"
-          echo "Event cohort periods: $EVENT_PERIODS"
-          echo "Weekly/monthly cohort periods: $INCLUDE_WM"
+          echo "Reports matrix: $MATRIX"
+          echo "Flat lookback: $LOOKBACK"
+          echo "Cohort lookback: $COHORT_LOOKBACK"
 
-      - name: Capture pre-run state
-        id: before
-        shell: bash
-        run: |
-          set +e
-          R=$(bq query --nouse_legacy_sql --format=csv --quiet \
-            "SELECT COUNT(*), CAST(MAX(date) AS STRING) FROM \`${GCP_PROJECT}.${BQ_DATASET}.app_daily_performance\`" \
-            2>/dev/null | tail -1)
-          ROWS=$(echo "$R" | cut -d, -f1)
-          LAST=$(echo "$R" | cut -d, -f2)
-          echo "rows=${ROWS:-0}" >> "$GITHUB_OUTPUT"
-          echo "last=${LAST:-}" >> "$GITHUB_OUTPUT"
-          echo "Before: ${ROWS:-0} rows; latest date ${LAST:-none}"
-          exit 0
+  sync:
+    name: Adjust ${{ matrix.report }} → BigQuery
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      # Two report families at once. Each job can use 4 concurrent Adjust HTTP calls,
+      # so account-wide concurrency stays around 8 instead of exploding to 40+.
+      max-parallel: 2
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
 
-      - name: Verify v3 loader
-        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS_JSON }}
+
+      - name: Install dependencies
         run: |
           set -euo pipefail
-          test -f adjust_to_bigquery.py || { echo "::error::adjust_to_bigquery.py is missing from repository root"; ls -la; exit 1; }
-          python -m py_compile adjust_to_bigquery.py
-          echo "✅ adjust_to_bigquery.py exists and compiles"
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Run Adjust → BigQuery v3
+      - name: Verify loader
+        run: |
+          set -euo pipefail
+          test -f adjust_to_bigquery.py
+          python -m py_compile adjust_to_bigquery.py
+          grep -q 'v3.2 PARALLEL-REPORT' adjust_to_bigquery.py || {
+            echo '::error::Repo is not running the v3.2 parallel-report loader'
+            exit 1
+          }
+
+      - name: Run ${{ matrix.report }} report
         env:
-          # Secrets
           ADJUST_API_TOKEN: ${{ secrets.ADJUST_API_TOKEN }}
           GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
           ADJUST_APP_TOKENS: ${{ secrets.ADJUST_APP_TOKENS }}
 
-          # Storage / app list
           APP_TOKENS_FILE: app_tokens.txt
           BQ_DATASET: adjust_data
           BQ_LOCATION: US
 
-          # Windows
-          LOOKBACK_DAYS: ${{ steps.profile.outputs.lookback }}
-          COHORT_LOOKBACK_DAYS: ${{ steps.profile.outputs.cohort_lookback }}
-          START_DATE: ${{ steps.profile.outputs.start_date }}
-          END_DATE: ${{ steps.profile.outputs.end_date }}
+          LOOKBACK_DAYS: ${{ needs.prepare.outputs.lookback }}
+          COHORT_LOOKBACK_DAYS: ${{ needs.prepare.outputs.cohort_lookback }}
+          START_DATE: ${{ needs.prepare.outputs.start_date }}
+          END_DATE: ${{ needs.prepare.outputs.end_date }}
 
-          # API batching / reliability
-          CHUNK_SIZE: ${{ steps.profile.outputs.chunk }}
-          MAX_WORKERS:        "6"
-          MAX_HTTP_IN_FLIGHT: "6"
-          METRIC_BATCH_SIZE: ${{ steps.profile.outputs.metric_batch }}
+          CHUNK_SIZE: ${{ needs.prepare.outputs.chunk }}
+          METRIC_BATCH_SIZE: ${{ needs.prepare.outputs.metric_batch }}
+
+          # Per-job concurrency. With max-parallel=2 above, global steady-state
+          # Adjust concurrency is bounded around 8 requests.
+          MAX_WORKERS: '4'
+          MAX_HTTP_IN_FLIGHT: '4'
           MAX_RETRIES: '6'
           REQUEST_TIMEOUT: '300'
 
-          # Report coverage
-          REPORTS: ${{ steps.profile.outputs.reports }}
-          COHORT_PERIODS: ${{ steps.profile.outputs.cohort_periods }}
-          EVENT_COHORT_PERIODS: ${{ steps.profile.outputs.event_periods }}
-          INCLUDE_WEEKLY_MONTHLY_COHORTS: ${{ steps.profile.outputs.include_wm }}
+          REPORTS: ${{ matrix.report }}
+          COHORT_PERIODS: ${{ needs.prepare.outputs.cohort_periods }}
+          EVENT_COHORT_PERIODS: ${{ needs.prepare.outputs.event_periods }}
+          INCLUDE_WEEKLY_MONTHLY_COHORTS: ${{ needs.prepare.outputs.include_wm }}
           COHORT_MATURITIES: 'immature,mature'
 
-          # Attribution / spend
           ATTRIBUTION_SOURCE: dynamic
-          # Empty means Adjust default/all available attribution types.
           ATTRIBUTION_TYPES: ''
           AD_SPEND_MODE: network
           SPEND_RECON_MODES: 'adjust,network,mixed'
 
-          # Reporting normalization
           REPORTING_CURRENCY: USD
           UTC_OFFSET: '+00:00'
-          DRY_RUN: ${{ steps.profile.outputs.dry_run }}
+          DRY_RUN: ${{ needs.prepare.outputs.dry_run }}
+
+          # Only one concurrent matrix job should rewrite the shared catalogs.
+          PERSIST_CATALOGS: ${{ matrix.report == 'app' && '1' || '0' }}
 
         run: python adjust_to_bigquery.py
 
-      # v3 replaces production windows transactionally. Row counts can
-      # legitimately decrease because corrected/zero Adjust responses clear
-      # stale rows, so do NOT use the old "must never fall by >5%" rule.
-      - name: Validate BigQuery after sync
-        if: success() && steps.profile.outputs.dry_run != '1'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          TABLES=(
-            app_daily_performance
-            campaign_daily_performance
-            country_daily_performance
-            spend_reconciliation_daily
-            cohort_daily_performance
-            event_daily_performance
-            event_cohort_daily_performance
-          )
-
-          FAIL=0
-          for T in "${TABLES[@]}"; do
-            EXISTS=$(bq query --nouse_legacy_sql --format=csv --quiet \
-              "SELECT COUNT(*) FROM \`${GCP_PROJECT}.${BQ_DATASET}.INFORMATION_SCHEMA.TABLES\` WHERE table_name='${T}'" \
-              2>/dev/null | tail -1 || echo 0)
-
-            if [[ "${EXISTS:-0}" == '0' ]]; then
-              echo "::warning::Table ${T} does not exist yet (possibly no supported/available data)."
-              continue
-            fi
-
-            R=$(bq query --nouse_legacy_sql --format=csv --quiet \
-              "SELECT COUNT(*) AS rows, CAST(MAX(date) AS STRING) AS latest, COUNTIF(date IS NULL OR app_token IS NULL OR app_token='') AS bad_keys FROM \`${GCP_PROJECT}.${BQ_DATASET}.${T}\`" \
-              2>/dev/null | tail -1)
-
-            ROWS=$(echo "$R" | cut -d, -f1)
-            LAST=$(echo "$R" | cut -d, -f2)
-            BAD=$(echo "$R" | cut -d, -f3)
-            echo "${T}: rows=${ROWS:-0}; latest=${LAST:-none}; bad_keys=${BAD:-0}"
-
-            if (( ${BAD:-0} > 0 )); then
-              echo "::error::${T} contains ${BAD} rows with a null/blank required key."
-              FAIL=1
-            fi
-          done
-
-          if (( FAIL > 0 )); then
-            exit 1
-          fi
-
-          echo '✅ Post-sync structural validation passed.'
-
-      - name: Write run summary
+      - name: Job summary
         if: always()
-        shell: bash
         run: |
           {
-            echo "## Adjust → BigQuery v3"
-            echo "- Profile: **${{ steps.profile.outputs.profile }}**"
-            echo "- Flat lookback: **${{ steps.profile.outputs.lookback }} days**"
-            echo "- Cohort lookback: **${{ steps.profile.outputs.cohort_lookback }} days**"
-            echo "- Reports: \`${{ steps.profile.outputs.reports }}\`"
-            echo "- Cohort periods: \`${{ steps.profile.outputs.cohort_periods }}\`"
-            echo "- Event cohort periods: \`${{ steps.profile.outputs.event_periods }}\`"
-            echo "- Previous app table: ${{ steps.before.outputs.rows || '0' }} rows; latest ${{ steps.before.outputs.last || 'none' }}"
+            echo "## Adjust report: ${{ matrix.report }}"
+            echo "- Profile: **${{ needs.prepare.outputs.profile }}**"
             echo "- Result: **${{ job.status }}**"
+            echo "- Per-job workers: **4**"
+            echo "- Per-job HTTP cap: **4**"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # GitHub may disable scheduled workflows in inactive public repositories.
-  # A monthly repository activity keeps the schedule alive.
-  keepalive:
-    name: Keep scheduled workflow active
+  final:
+    name: Adjust sync summary
+    needs: [prepare, sync]
+    if: always()
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule'
-    permissions:
-      contents: write
     steps:
-      - uses: actions/checkout@v4
-      - name: Monthly keepalive commit
-        shell: bash
+      - name: Final result
         run: |
-          set -euo pipefail
-          if [[ "$(date -u +%d)" != '01' ]]; then
-            echo 'Not the first day of the month; no keepalive commit needed.'
-            exit 0
+          echo "Profile: ${{ needs.prepare.outputs.profile }}"
+          echo "Matrix result: ${{ needs.sync.result }}"
+          if [[ '${{ needs.sync.result }}' != 'success' ]]; then
+            echo '::error::One or more Adjust report jobs failed/cancelled. Check the individual matrix job.'
+            exit 1
           fi
-          date -u +'%Y-%m-%dT%H:%M:%SZ' > .keepalive
-          git config user.name 'keepalive-bot'
-          git config user.email 'keepalive-bot@users.noreply.github.com'
-          git add .keepalive
-          git commit -m 'chore: keepalive [skip ci]' || exit 0
-          git push
+          echo '✅ All selected Adjust report families completed.'
