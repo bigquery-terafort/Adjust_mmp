@@ -1,381 +1,422 @@
 """
-Adjust Report Service  →  BigQuery   ·   "SAB KUCH" EDITION          v2.1
-==========================================================================
-🆕 v2.1 (2026-09-17) — CHAAR badlav:
-   ① app_token REQUIRED — "changed mode from REQUIRED to NULLABLE" 400 fix
-   ② cohort_maturity=mature — SAB SE AHEM. Adjust ka default `immature` hai,
-      jo adhoore cohorts bhi gin leta hai → d7/d30 ROAS jhoota kam aata tha.
-   ③ ~30 naye metrics — poora cohort set d0..d90, ad_revenue cohort,
-      engagement, attribution breakdown, SKAdNetwork
-   ④ do naye report — `cohort` (period dimension = asli cohort table) aur
-      `event` (har custom event alag)
+Adjust Report Service -> BigQuery · COMPLETE REPORTING WAREHOUSE v3.0
+=====================================================================
+Purpose
+-------
+Pull the maximum practical/defensible coverage available from Adjust's
+AGGREGATED Report Service API into BigQuery for product, monetization and UA
+analysis.
 
-   ⚠️ USER-LEVEL data Report Service API se MILTA HI NAHI. Us ke liye
-      Adjust Dashboard → Raw Data Export → Cloud Storage (GCS) chahiye,
-      phir GCS → BigQuery ka alag loader. Wo is script ka kaam nahi.
+Important boundary
+------------------
+Report Service is aggregated data. It is NOT raw user/device-level data.
+For user-level installs/sessions/events/reattributions/ad revenue/uninstalls,
+also enable Adjust Raw Data Export -> Cloud Storage and load that separately.
 
-v1 sirf 4 metrics aur app-level grain laata tha. v2 SAB kuch laata hai:
-har metric, har dimension, teen alag grain pe.
+Major v3 fixes vs v2.x
+----------------------
+1. Uses documented `attribution_types` (plural), not `attribution_type`.
+2. Uses Adjust Events endpoint to discover real event slugs per app.
+3. Uses Filters Data endpoint to discover dimensions/cohort periods/options.
+4. Supports D0-D120 cohort periods (plus optional W/M periods).
+5. Cohorts are stored LONG: one row per cohort_period, avoiding thousands of
+   metric columns and BigQuery column explosion.
+6. Event cohorts are stored LONG by event_slug + cohort_period.
+7. Stable network IDs (campaign/adgroup/creative IDs) are requested.
+8. Metric requests are chunked and merged by dimensions.
+9. Supported metrics/dimensions are negotiated with divide-and-conquer probes.
+10. Successful zero-row responses correctly CLEAR stale data for the window.
+11. Writes use staging + a BigQuery transaction, so failed loads never leave a
+    production table half-deleted.
+12. Separate spend reconciliation table can store adjust/network/mixed cost.
+13. Separate mature + immature cohort snapshots are supported.
+14. Rolling cohort window defaults to 150 days so D120 can mature.
+15. Catalog tables store what Adjust says is available (dimensions, periods,
+    events, filter options) for auditability and future schema changes.
 
-────────────────────────────────────────────────────────────────────────
-TEEN TABLE — teen alag grain
-────────────────────────────────────────────────────────────────────────
-  1. app_daily_performance
-     day × app × store × os
-     → Looker/dashboards ke liye halki table, app-level totals
+Recommended scheduled defaults
+------------------------------
+REPORTS=app,campaign,country,cohort,event,event_cohort,spend
+LOOKBACK_DAYS=14
+COHORT_LOOKBACK_DAYS=150
+COHORT_MATURITIES=immature,mature
+AD_SPEND_MODE=network
+SPEND_RECON_MODES=adjust,network,mixed
+ATTRIBUTION_SOURCE=dynamic
 
-  2. campaign_daily_performance          🔑 ASLI MMP KA MAQSAD
-     day × app × os × partner × campaign × adgroup × creative
-     → kaunsa network/campaign kaunse install laaya, CPI kya raha
+For all D0-D120 event cohort periods, set:
+EVENT_COHORT_PERIODS=all_days
+This can be API-expensive if you have many custom events. The default uses the
+most decision-useful periods while the general cohort table still stores D0-D120.
 
-  3. country_daily_performance
-     day × app × os × country × device
-     → geo/device optimization
+Required env
+------------
+ADJUST_API_TOKEN
+GCP_PROJECT
+GCP_CREDENTIALS_JSON
+ADJUST_APP_TOKENS   comma separated, OR APP_TOKENS_FILE
 
-  Alag tables isliye ke attribution dimensions ke saath rows lakhon mein
-  chale jate hain. Sab ek table mein daalo to:
-     · Looker slow ho jata hai
-     · app-level totals galat aane lagte hain (SUM double ho jata hai)
-     · partition/cluster ka faida khatam
+Optional env
+------------
+BQ_DATASET=adjust_data
+BQ_LOCATION=US
+LOOKBACK_DAYS=14
+COHORT_LOOKBACK_DAYS=150
+CHUNK_SIZE=25
+METRIC_BATCH_SIZE=35
+MAX_RETRIES=6
+REQUEST_TIMEOUT=300
+UTC_OFFSET=+00:00
+REPORTING_CURRENCY=USD
+AD_SPEND_MODE=network
+SPEND_RECON_MODES=adjust,network,mixed
+ATTRIBUTION_SOURCE=dynamic
+ATTRIBUTION_TYPES=                 # empty = Adjust default/all available
+COHORT_MATURITIES=immature,mature
+COHORT_PERIODS=all_days            # all_days | key | comma slugs e.g. d0,d1,d7
+EVENT_COHORT_PERIODS=key           # all_days | key | comma slugs
+INCLUDE_WEEKLY_MONTHLY_COHORTS=0
+REPORTS=app,campaign,country,cohort,event,event_cohort,spend
+START_DATE=                         # YYYY-MM-DD optional backfill override
+END_DATE=                           # YYYY-MM-DD optional backfill override
+DRY_RUN=0
 
-────────────────────────────────────────────────────────────────────────
-🤝 AUTO-NEGOTIATION — "sab maango, jo mile wo lo"
-────────────────────────────────────────────────────────────────────────
-Adjust ke exact metric/dimension naam har account pe ek jaise nahi hote
-(kuch features plan ke saath aate hain). Naam yaad se likhne ka anjaam:
-
-    · galat naam  → Adjust warning deta hai, column KHALI aata hai
-    · aadha sahi  → koi error nahi, bas data adhoora
-    · mahino kisi ko pata nahi chalta
-
-Isliye v2 pehli baar POORI list maangta hai. Agar Adjust radd kare to
-har metric/dimension ALAG ALAG test karta hai, jo chale wahi rakhta hai,
-aur baqi ko saaf saaf log karta hai. Nateeja memory mein cache hota hai —
-baaki chunks pe dobara test nahi hota.
-
-    ✅ Jo mila wo poora aata hai
-    ❌ Jo nahi mila wo LOG hota hai (chup-chaap gayab nahi hota)
-
-Schema bhi ISI ke mutabiq banti hai — khali columns nahi bante.
-
-────────────────────────────────────────────────────────────────────────
-🛡️ v1 ke SAARE 10 GUARDS bar-qarar hain
-────────────────────────────────────────────────────────────────────────
-  #1  DELETE account-scoped   (`app_token IN UNNEST(@ok)`)
-  #2  fail = None, khali list NAHI
-  #3  har call pe timeout
-  #4  error body parse + raise
-  #5  koi app khamoshi se nahi girta
-  #6  FAILURES → sys.exit(1)
-  #7  load job (streaming NAHI) + row-count verify
-      → TRUNCATE+streaming ne Facebook mein 20% rows khamoshi se khaye the
-  #8  har HTTP call pe retry + backoff
-  #9  adhoori discovery pe BigQuery ko haath hi na lagao
-  #10 asli error message log (raise_for_status se pehle body)
-
-────────────────────────────────────────────────────────────────────────
-ENV VARS
-────────────────────────────────────────────────────────────────────────
-LAZMI:  ADJUST_API_TOKEN · GCP_PROJECT · GCP_CREDENTIALS_JSON
-APPS :  ADJUST_APP_TOKENS (comma) ya APP_TOKENS_FILE (default app_tokens.txt)
-
-OPTIONAL:
-  BQ_DATASET        adjust_data
-  BQ_LOCATION       US
-  LOOKBACK_DAYS     30
-  CHUNK_SIZE        50
-  REPORTS           app,campaign,country   (kaunsi tables banani hain)
-  MAX_RETRIES       5
-  REQUEST_TIMEOUT   300
-  UTC_OFFSET        +00:00
-  ATTRIBUTION_TYPE  all
-  DRY_RUN           0
-==========================================================================
+Docs checked: 2026-09-23
 """
 
-import os
-import sys
+from __future__ import annotations
+
 import json
-import time
 import logging
-from datetime import date, timedelta
+import os
+import re
+import sys
+import time
+import uuid
+from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Iterable
 
 import requests
-from google.cloud import bigquery
 from google.api_core import exceptions as gexc
+from google.cloud import bigquery
 from google.oauth2 import service_account
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("adjust_v2")
+# -----------------------------------------------------------------------------
+# Logging / constants
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("adjust_v3")
 
-ADJUST_ENDPOINT = "https://automate.adjust.com/reports-service/report"
+REPORT_ENDPOINT = "https://automate.adjust.com/reports-service/report"
+EVENTS_ENDPOINT = "https://automate.adjust.com/reports-service/events"
+FILTERS_ENDPOINT = "https://automate.adjust.com/reports-service/filters_data"
 
-ADJUST_API_TOKEN     = os.environ.get("ADJUST_API_TOKEN", "")
-GCP_PROJECT          = os.environ.get("GCP_PROJECT", "")
-GCP_CREDENTIALS_JSON = os.environ.get("GCP_CREDENTIALS_JSON", "")
+ADJUST_API_TOKEN = os.environ.get("ADJUST_API_TOKEN", "").strip()
+GCP_PROJECT = os.environ.get("GCP_PROJECT", "").strip()
+GCP_CREDENTIALS_JSON = os.environ.get("GCP_CREDENTIALS_JSON", "").strip()
 
-BQ_DATASET  = os.environ.get("BQ_DATASET", "adjust_data")
-BQ_LOCATION = os.environ.get("BQ_LOCATION", "US")
+BQ_DATASET = os.environ.get("BQ_DATASET", "adjust_data").strip()
+BQ_LOCATION = os.environ.get("BQ_LOCATION", "US").strip()
 
-LOOKBACK_DAYS    = int(os.environ.get("LOOKBACK_DAYS", "30"))
-CHUNK_SIZE       = int(os.environ.get("CHUNK_SIZE", "50"))
-MAX_RETRIES      = int(os.environ.get("MAX_RETRIES", "5"))
-REQUEST_TIMEOUT  = int(os.environ.get("REQUEST_TIMEOUT", "300"))
-UTC_OFFSET       = os.environ.get("UTC_OFFSET", "+00:00")
-ATTRIBUTION_TYPE = os.environ.get("ATTRIBUTION_TYPE", "all")
-# 🆕 v2.1 — COHORT MATURITY: sab se ahem accuracy fix.
-#    Adjust ka default `immature` hai — d30 ROAS un cohorts ka bhi deta hai jo
-#    abhi 30 din purane hue hi nahi. Natija: adhoore numbers, ROAS jhoota kam.
-#    `mature` sirf POORE ho chuke cohorts deta hai, baqi par 0 — asli number.
-#    Dono chahiyen to do run karo: COHORT_MATURITY=mature aur =immature.
-COHORT_MATURITY  = os.environ.get("COHORT_MATURITY", "mature")
-DRY_RUN          = os.environ.get("DRY_RUN", "0") == "1"
-ENABLED_REPORTS  = [r.strip().lower() for r in
-                    os.environ.get("REPORTS", "app,campaign,country,cohort,event").split(",")
-                    if r.strip()]
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "14"))
+COHORT_LOOKBACK_DAYS = int(os.environ.get("COHORT_LOOKBACK_DAYS", "150"))
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "25"))
+METRIC_BATCH_SIZE = int(os.environ.get("METRIC_BATCH_SIZE", "35"))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "6"))
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "300"))
+UTC_OFFSET = os.environ.get("UTC_OFFSET", "+00:00").strip()
+REPORTING_CURRENCY = os.environ.get("REPORTING_CURRENCY", "USD").strip().upper()
+AD_SPEND_MODE = os.environ.get("AD_SPEND_MODE", "network").strip().lower()
+SPEND_RECON_MODES = [x.strip().lower() for x in os.environ.get(
+    "SPEND_RECON_MODES", "adjust,network,mixed").split(",") if x.strip()]
+ATTRIBUTION_SOURCE = os.environ.get("ATTRIBUTION_SOURCE", "dynamic").strip().lower()
+ATTRIBUTION_TYPES = [x.strip() for x in os.environ.get("ATTRIBUTION_TYPES", "").split(",") if x.strip()]
+COHORT_MATURITIES = [x.strip().lower() for x in os.environ.get(
+    "COHORT_MATURITIES", "immature,mature").split(",") if x.strip()]
+COHORT_PERIODS_SETTING = os.environ.get("COHORT_PERIODS", "all_days").strip().lower()
+EVENT_COHORT_PERIODS_SETTING = os.environ.get("EVENT_COHORT_PERIODS", "key").strip().lower()
+INCLUDE_WEEKLY_MONTHLY_COHORTS = os.environ.get("INCLUDE_WEEKLY_MONTHLY_COHORTS", "0") == "1"
+DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 
-APP_TOKENS_ENV  = os.environ.get("ADJUST_APP_TOKENS", "")
+ENABLED_REPORTS = [x.strip().lower() for x in os.environ.get(
+    "REPORTS",
+    "app,campaign,country,cohort,event,event_cohort,spend",
+).split(",") if x.strip()]
+
+APP_TOKENS_ENV = os.environ.get("ADJUST_APP_TOKENS", "")
 APP_TOKENS_FILE = os.environ.get("APP_TOKENS_FILE", "app_tokens.txt")
+START_DATE_ENV = os.environ.get("START_DATE", "").strip()
+END_DATE_ENV = os.environ.get("END_DATE", "").strip()
 
-RUN_ID   = f"{date.today().isoformat()}-{int(time.time())}"
-FAILURES = []
-
-
-def record_failure(where, detail):
-    msg = f"{where}: {detail}"
-    FAILURES.append(msg)
-    log.error("  ❌ %s", msg)
-
-
-def die(msg):
-    log.error("=" * 74)
-    log.error("🔴 %s", msg)
-    log.error("   BigQuery ko HAATH NAHI LAGAYA — purana data mehfooz hai.")
-    log.error("=" * 74)
-    sys.exit(1)
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  SAB KUCH — poori list. Jo Adjust na de, wo khud gir jayega (log ke saath).
-# ══════════════════════════════════════════════════════════════════════════
-ALL_METRICS = [
-    # core
-    "installs", "clicks", "impressions", "sessions",
-    "limit_ad_tracking_installs", "limit_ad_tracking_install_rate",
-    "click_conversion_rate", "impression_conversion_rate",
-    # lifecycle
-    "reattributions", "reattribution_reinstalls", "reinstalls",
-    "uninstalls", "uninstall_cohort", "uninstall_rate",
-    "first_reinstalls", "first_reattributions", "deattributions",
-    # users
-    "daus", "waus", "maus",
-    # revenue
-    "revenue", "revenue_events", "revenue_per_install",
-    "ad_revenue", "all_revenue", "arpdau", "arpu",
-    # cost — UA spend Adjust ke andar se
-    "cost", "network_cost", "network_cost_diff", "ad_spend",
-    "ecpi", "ecpi_all", "cost_per_install",
-    "click_cost", "impression_cost", "install_cost",
-    # profitability
-    "gross_profit", "roas", "return_on_investment",
-    # events
-    "events", "first_events", "all_events",
-    # cohort (shayad alag endpoint maange — negotiation bata degi)
-    "retained_users_d1", "retained_users_d7", "retained_users_d30",
-    "retention_rate_d1", "retention_rate_d7", "retention_rate_d30",
-    "roas_d0", "roas_d1", "roas_d7", "roas_d30",
-    "revenue_total_d0", "revenue_total_d7", "revenue_total_d30",
-    "lifetime_value",
-    # ── 🆕 v2.1: POORA cohort set (d0 se d90) ──
-    #    Negotiation khud ek-ek test karegi — jo Adjust na de wo chup-chaap gir
-    #    jayega (log ke saath). Is liye "sab maango" mehfooz hai.
-    "retained_users_d0", "retained_users_d3", "retained_users_d14",
-    "retained_users_d60", "retained_users_d90",
-    "retention_rate_d0", "retention_rate_d3", "retention_rate_d14",
-    "retention_rate_d60", "retention_rate_d90",
-    "roas_d3", "roas_d14", "roas_d60", "roas_d90",
-    "revenue_total_d1", "revenue_total_d3", "revenue_total_d14",
-    "revenue_total_d60", "revenue_total_d90",
-    # 🆕 ad revenue cohort
-    "ad_revenue_d0", "ad_revenue_d1", "ad_revenue_d7", "ad_revenue_d30",
-    # 🆕 engagement
-    "sessions_per_user", "time_spent", "engagement_rate",
-    # 🆕 attribution breakdown
-    "attribution_impressions", "attribution_clicks", "attribution_unknown",
-    "network_installs", "network_clicks", "network_impressions",
-    # 🆕 SKAdNetwork (iOS 14+ attribution)
-    "skad_installs", "skad_total_installs", "skad_qualifier_installs",
-    "skad_revenue", "skad_roas",
-]
-
-# Ye INTEGER hain; baqi sab FLOAT (rates/revenue/cost)
-INT_METRICS = {
-    "installs", "clicks", "impressions", "sessions",
-    "limit_ad_tracking_installs", "reattributions", "reattribution_reinstalls",
-    "reinstalls", "uninstalls", "uninstall_cohort",
-    "first_reinstalls", "first_reattributions", "deattributions",
-    "daus", "waus", "maus", "revenue_events",
-    "events", "first_events", "all_events",
-    "retained_users_d1", "retained_users_d7", "retained_users_d30",
-    # 🆕 v2.1
-    "retained_users_d0", "retained_users_d3", "retained_users_d14",
-    "retained_users_d60", "retained_users_d90",
-    "attribution_impressions", "attribution_clicks", "attribution_unknown",
-    "network_installs", "network_clicks", "network_impressions",
-    "skad_installs", "skad_total_installs", "skad_qualifier_installs",
-}
-
-# ── TEEN REPORT ────────────────────────────────────────────────────────────
-REPORTS = [
-    {
-        "key":        "app",
-        "table":      "app_daily_performance",
-        "dimensions": ["day", "app", "app_token", "store_id", "store_type", "os_name"],
-        "cluster":    ["app_token", "os_name"],
-        "desc":       "app-level — Looker/dashboards",
-    },
-    {
-        "key":        "campaign",
-        "table":      "campaign_daily_performance",
-        "dimensions": ["day", "app", "app_token", "os_name",
-                       "partner_name", "network", "campaign",
-                       "adgroup", "creative"],
-        "cluster":    ["app_token", "partner_name", "campaign"],
-        "desc":       "🔑 attribution — kaunsa network/campaign kya laaya",
-    },
-    {
-        "key":        "country",
-        "table":      "country_daily_performance",
-        "dimensions": ["day", "app", "app_token", "os_name",
-                       "country", "country_code", "device_type"],
-        "cluster":    ["app_token", "country_code"],
-        "desc":       "geo/device breakdown",
-    },
-    # ── 🆕 v2.1 ──
-    {
-        "key":        "cohort",
-        "table":      "cohort_daily_performance",
-        "dimensions": ["day", "app", "app_token", "os_name",
-                       "partner_name", "campaign", "country_code", "period"],
-        "cluster":    ["app_token", "partner_name", "period"],
-        "desc":       "🔑 ASLI COHORT — har period ki apni row (d0/d1/d7/d30...)",
-    },
-    {
-        "key":        "event",
-        "table":      "event_daily_performance",
-        "dimensions": ["day", "app", "app_token", "os_name",
-                       "partner_name", "campaign", "event", "event_name"],
-        "cluster":    ["app_token", "event_name"],
-        "desc":       "har custom event alag — purchase / level / tutorial",
-    },
-]
-
-
-# ─── HELPERS ───────────────────────────────────────────────────────────────
-def _to_int(v):
-    try:
-        return int(float(v)) if v not in (None, "") else 0
-    except (TypeError, ValueError):
-        return 0
-
-
-def _to_float(v):
-    try:
-        return float(v) if v not in (None, "") else 0.0
-    except (TypeError, ValueError):
-        return 0.0
-
+RUN_ID = f"{date.today().isoformat()}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+FAILURES: list[str] = []
 
 SENTINELS = {"unknown", "missing", "n/a", "na", "-", "none", "null", ""}
+RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+
+# -----------------------------------------------------------------------------
+# Report definitions
+# -----------------------------------------------------------------------------
+# Stable IDs are deliberately included. Names can change; IDs are join keys.
+REPORTS: dict[str, dict[str, Any]] = {
+    "app": {
+        "table": "app_daily_performance",
+        "dimensions": [
+            "day", "app", "app_token", "store_id", "store_type",
+            "os_name", "platform", "currency_code",
+        ],
+        "cluster": ["app_token", "os_name", "store_type"],
+        "desc": "app/store/os daily KPIs",
+    },
+    "campaign": {
+        "table": "campaign_daily_performance",
+        "dimensions": [
+            "day", "app", "app_token", "os_name", "platform",
+            "partner_name", "partner", "partner_id", "channel", "network",
+            "ad_account_id",
+            "campaign", "campaign_network", "campaign_id_network",
+            "adgroup", "adgroup_network", "adgroup_id_network",
+            "creative", "creative_network", "creative_id_network",
+            "source_network", "source_id_network",
+            "country_code",
+        ],
+        "cluster": ["app_token", "partner", "campaign_id_network", "country_code"],
+        "desc": "MMP attribution / campaign / adgroup / creative",
+    },
+    "country": {
+        "table": "country_daily_performance",
+        "dimensions": [
+            "day", "app", "app_token", "os_name", "platform",
+            "country", "country_code", "region", "device_type",
+            "partner_name", "network",
+        ],
+        "cluster": ["app_token", "country_code", "os_name"],
+        "desc": "country/business-region/device KPIs",
+    },
+    "spend": {
+        "table": "spend_reconciliation_daily",
+        "dimensions": [
+            "day", "app", "app_token", "partner_name", "partner", "network",
+            "ad_account_id", "campaign_network", "campaign_id_network",
+            "adgroup_network", "adgroup_id_network",
+            "creative_network", "creative_id_network", "country_code",
+        ],
+        "cluster": ["app_token", "partner", "campaign_id_network"],
+        "desc": "adjust/network/mixed spend reconciliation",
+    },
+}
+
+COHORT_DIMENSIONS = [
+    "day", "app", "app_token", "os_name", "platform",
+    "partner_name", "partner", "partner_id", "channel", "network",
+    "campaign_network", "campaign_id_network",
+    "adgroup_network", "adgroup_id_network",
+    "creative_network", "creative_id_network",
+    "country_code",
+]
+
+EVENT_DIMENSIONS = [
+    "day", "app", "app_token", "os_name", "platform",
+    "partner_name", "partner", "network",
+    "campaign_network", "campaign_id_network",
+    "country_code",
+]
+
+# -----------------------------------------------------------------------------
+# Metric candidates
+# -----------------------------------------------------------------------------
+# These cover core conversion, lifecycle, monetization, cost, fraud, assist,
+# subscription and SKAN families. Unsupported/plan-gated metrics are filtered by
+# runtime negotiation instead of silently creating empty columns.
+BASE_METRICS = [
+    # Acquisition / conversion
+    "installs", "clicks", "impressions", "sessions", "events",
+    "click_conversion_rate", "impression_conversion_rate", "ctr",
+    "limit_ad_tracking_installs", "limit_ad_tracking_install_rate",
+    "reattributions", "reattribution_reinstalls", "reinstalls",
+    "first_reinstalls", "first_uninstalls", "first_reattributions",
+    "uninstalls", "uninstall_cohort", "uninstall_rate", "deattributions",
+    "gdpr_forgets", "daus", "waus", "maus",
+    # ATT
+    "att_status_authorized", "att_status_non_determined", "att_status_denied",
+    "att_status_restricted", "att_consent_rate",
+    # Revenue / ads / payer
+    "revenue", "cohort_revenue", "revenue_events", "revenue_per_install",
+    "ad_impressions", "ad_revenue", "cohort_ad_revenue", "ad_rpm",
+    "all_revenue", "cohort_all_revenue", "arpdau", "arpu",
+    # Spend
+    "cost", "adjust_cost", "network_cost", "network_cost_diff",
+    "click_cost", "impression_cost", "install_cost", "event_cost",
+    "paid_clicks", "paid_impressions", "paid_installs",
+    "ecpi", "ecpi_all", "network_ecpi", "ecpc", "ecpm",
+    "cost_per_install", "gross_profit", "roas", "return_on_investment",
+    # Assist / qualifiers
+    "assisted_installs", "qualifiers", "impression_based_qualifiers",
+    "click_based_qualifiers", "assisted_reattributions", "non_assisted_installs",
+    # Fraud basics
+    "rejected_installs", "rejected_install_rate", "rejected_installs_anon_ip",
+    "rejected_installs_invalid_signature", "rejected_install_invalid_signature_rate",
+    # Subscription events / revenue
+    "subscrevnt_activation_events", "subscrevnt_billing_retry_events",
+    "subscrevnt_cancellation_events", "subscrevnt_discounted_offer_events",
+    "subscrevnt_expiration_events", "subscrevnt_first_conversion_events",
+    "subscrevnt_grace_period_events", "subscrevnt_on_hold_events",
+    "subscrevnt_paused_events", "subscrevnt_price_accepted_events",
+    "subscrevnt_reactivation_events", "subscrevnt_refund_events",
+    "subscrevnt_renewal_events", "subscrevnt_trial_started_events",
+    "subscrevnt_revenue", "subscrevnt_unknown_revenue",
+    # InSight / incremental if entitled
+    "average_revenue_per_event", "incremental_revenue", "incremental_roas",
+    # SKAN common
+    "skad_installs", "skad_reinstalls", "skad_total_installs", "skad_qualifiers",
+    "invalid_payloads", "valid_conversions", "network_ad_spend_skan",
+    "skad_revenue_min_roas", "skad_revenue_est_roas", "skad_revenue_max_roas",
+    "skan_total_revenue_min", "skan_total_revenue_est", "skan_total_revenue_max",
+    "skan_ad_rpu_min", "skan_ad_rpu_est", "skan_ad_rpu_max",
+    "skan_iap_rpu_min", "skan_iap_rpu_est", "skan_iap_rpu_max",
+    "general_revenue_events_min", "general_revenue_events_est", "general_revenue_events_max",
+]
+BASE_METRICS += [f"conversion_{i}" for i in range(1, 7)]
+BASE_METRICS += [f"conversion_value_{i}" for i in range(0, 64)]
+BASE_METRICS = list(dict.fromkeys(BASE_METRICS))
+
+SPEND_METRICS = [
+    "cost", "adjust_cost", "network_cost", "network_cost_diff",
+    "click_cost", "impression_cost", "install_cost", "event_cost",
+    "paid_clicks", "paid_impressions", "paid_installs",
+    "clicks", "impressions", "installs", "network_clicks", "network_impressions",
+    "network_installs", "ecpc", "ecpm", "ecpi", "network_ecpi",
+]
+
+# Standardized field -> Adjust API metric template.
+# Period is lower-case: d0..d120, w0..w52, m0..m36.
+COHORT_FAMILIES: dict[str, str] = {
+    # Retention / sessions / engagement
+    "cohort_size": "cohort_size_{p}",
+    "retained_users": "retained_users_{p}",
+    "retention_rate": "retention_rate_{p}",
+    "sessions": "sessions_{p}",
+    "non_install_sessions": "non_install_sessions_{p}",
+    "sessions_per_user": "sessions_per_user_{p}",
+    "time_spent": "time_spent_{p}",
+    "time_spent_rate": "time_spent_rate_{p}",
+    "time_spent_per_user": "time_spent_per_user_{p}",
+    "time_spent_per_active_user": "time_spent_per_active_user_{p}",
+    "time_spent_per_session": "time_spent_per_session_{p}",
+    # Ad monetization
+    "ad_impressions": "ad_impressions_{p}",
+    "ad_impressions_total": "ad_impressions_total_{p}",
+    "ad_impressions_total_in_cohort": "ad_impressions_total_in_cohort_{p}",
+    "ad_revenue": "ad_revenue_{p}",
+    "ad_revenue_total": "ad_revenue_total_{p}",
+    "ad_revenue_total_per_user": "ad_revenue_total_per_user_{p}",
+    "ad_revenue_total_per_paying_user": "ad_revenue_total_per_paying_user_{p}",
+    "ad_revenue_total_in_cohort": "ad_revenue_total_in_cohort_{p}",
+    "ad_rpm": "ad_rpm_{p}",
+    # IAP revenue
+    "revenue": "revenue_{p}",
+    "revenue_per_user": "revenue_per_user_{p}",
+    "revenue_per_paying_user": "revenue_per_paying_user_{p}",
+    "revenue_total": "revenue_total_{p}",
+    "revenue_total_per_user": "revenue_total_per_user_{p}",
+    "revenue_total_per_paying_user": "revenue_total_per_paying_user_{p}",
+    "revenue_total_in_cohort": "revenue_total_in_cohort_{p}",
+    "revenue_events": "revenue_events_{p}",
+    "revenue_events_total": "revenue_events_total_{p}",
+    "revenue_events_per_user": "revenue_events_per_user_{p}",
+    "revenue_events_per_paying_user": "revenue_events_per_paying_user_{p}",
+    # All revenue / LTV / ROAS
+    "all_revenue": "all_revenue_{p}",
+    "all_revenue_per_user": "all_revenue_per_user_{p}",
+    "all_revenue_total": "all_revenue_total_{p}",
+    "all_revenue_total_per_user": "all_revenue_total_per_user_{p}",
+    "all_revenue_total_in_cohort": "all_revenue_total_in_cohort_{p}",
+    "lifetime_value": "lifetime_value_{p}",
+    "lifetime_value_ad": "lifetime_value_ad_{p}",
+    "lifetime_value_iap": "lifetime_value_iap_{p}",
+    "paying_user_lifetime_value": "paying_user_lifetime_value_{p}",
+    "paying_user_lifetime_value_ad": "paying_user_lifetime_value_ad_{p}",
+    "paying_user_lifetime_value_iap": "paying_user_lifetime_value_iap_{p}",
+    "roas": "roas_{p}",
+    "roas_ad": "roas_ad_{p}",
+    "roas_iap": "roas_iap_{p}",
+    # Payer metrics
+    "first_paying_users": "first_paying_users_{p}",
+    "first_paying_users_total": "first_paying_users_total_{p}",
+    "paying_users": "paying_users_{p}",
+    "paying_user_size": "paying_user_size_{p}",
+    "paying_users_rate": "paying_users_rate_{p}",
+    "paying_user_rate": "paying_user_rate_{p}",
+    "paying_users_retention_rate": "paying_users_retention_rate_{p}",
+    "retention_rate_paying_users": "retention_rate_paying_users_{p}",
+    "first_time_paying_user_conversion_rate": "first_time_paying_user_conversion_rate_{p}",
+    "first_time_paying_user_conversion_rate_total": "first_time_paying_user_conversion_rate_total_{p}",
+    "paying_user_conversion_rate": "paying_user_conversion_rate_{p}",
+    "cost_per_first_time_paying_user_total": "cost_per_paying_user_{p}",
+    # Lifecycle
+    "deattributions": "deattributions_{p}",
+    "deattributions_per_user": "deattributions_per_user_{p}",
+    "reattributions": "reattributions_{p}",
+    "reattributions_per_user": "reattributions_per_user_{p}",
+    "reinstalls": "reinstalls_{p}",
+    "first_reinstalls": "first_reinstalls_{p}",
+    "uninstalls": "uninstalls_{p}",
+    "first_uninstalls": "first_uninstalls_{p}",
+    "gdpr_forgets": "gdpr_forgets_{p}",
+}
+
+EVENT_COHORT_FAMILIES: dict[str, str] = {
+    "events": "{e}_{p}_events_cohort",
+    "conversions": "{e}_{p}_conversions_cohort",
+    "revenue": "{e}_{p}_revenue_cohort",
+    "converted_user_size": "{e}_{p}_converted_user_size_cohort",
+    "events_per_conversion": "{e}_{p}_events_per_conversion_cohort",
+    "revenue_per_conversion": "{e}_{p}_revenue_per_conversion_cohort",
+    "events_rate": "{e}_{p}_events_rate_cohort",
+    "conversions_rate": "{e}_{p}_conversions_rate_cohort",
+    "events_cost": "{e}_{p}_events_cost_cohort",
+    "conversions_cost": "{e}_{p}_conversions_cost_cohort",
+    "events_per_period": "{e}_{p}_events_per_period",
+    "revenue_per_period": "{e}_{p}_revenue_per_period",
+}
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def record_failure(where: str, detail: Any) -> None:
+    msg = f"{where}: {detail}"
+    FAILURES.append(msg)
+    log.error("❌ %s", msg)
 
 
-def _clean(v):
-    """Adjust ke sentinel ('unknown'/'missing') ko NULL bana do."""
+def die(msg: str) -> None:
+    log.error("=" * 88)
+    log.error("🔴 %s", msg)
+    log.error("=" * 88)
+    raise SystemExit(1)
+
+
+def _clean(v: Any) -> str | None:
     if v is None:
         return None
     s = str(v).strip()
     return None if s.lower() in SENTINELS else s
 
 
-def derive_store_keys(store_id, store_type, os_name):
-    """
-    Adjust ka store_id → app_master_v2 ke join keys.
-
-        Android google_play : "com.example.app"  → android_package
-        iOS app_store       : "1234567890"       → apple_id (INT64)
-        Amazon appstore     : "B0CX5N7R6L"       → amazon_asin
-
-    Asli data se seekha (2026-08-28):
-      · store_type 'app_store' aata hai (na ke 'itunes')
-      · sentinel DO hain: 'unknown' AUR 'missing'
-      · amazon rows maujood hain — ASIN, 11,450 installs
-      · iOS ka bundle-id kabhi android_package NAHI banana (master alag
-        column `ios_bundle_id` rakhta hai) — warna jhoota mapping ban jata
-
-    Samajh na aaye to sab None — jhoota mapping se behtar hai ke row
-    unmapped rahe aur monitor use pakde.
-    """
-    sid = _clean(store_id)
-    if not sid:
-        return None, None, None
-
-    os_l = (os_name or "").strip().lower()
-    st_l = (store_type or "").strip().lower()
-
-    if "amazon" in st_l:
-        return None, None, sid.upper()
-
-    is_ios = ("ios" in os_l) or ("app_store" in st_l) or ("itunes" in st_l)
-    is_and = ("android" in os_l) or ("google" in st_l) or ("play" in st_l)
-
-    if sid.isdigit():
-        if is_and:
-            return None, None, None       # numeric + android = shak
-        try:
-            return None, int(sid), None
-        except ValueError:
-            return None, None, None
-
-    if "." in sid:
-        if is_ios:
-            return None, None, None       # iOS bundle — apple_id nahi
-        return sid.lower(), None, None
-
-    return None, None, None
+def _num(v: Any) -> float | None:
+    if v in (None, ""):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
-def load_app_tokens():
-    if APP_TOKENS_ENV.strip():
-        tokens = [t.strip() for t in APP_TOKENS_ENV.split(",")]
-        src = "ADJUST_APP_TOKENS env"
-    elif os.path.exists(APP_TOKENS_FILE):
-        with open(APP_TOKENS_FILE, "r", encoding="utf-8") as fh:
-            tokens = [ln.split("#", 1)[0].strip() for ln in fh]
-        src = f"file {APP_TOKENS_FILE}"
-    else:
-        cwd = os.getcwd()
-        log.error("Working directory: %s", cwd)
-        try:
-            for f in sorted(os.listdir(cwd))[:40]:
-                log.error("   • %s%s", f,
-                          "  👈 ye chahiye tha" if f == APP_TOKENS_FILE else "")
-        except OSError:
-            pass
-        die(f"App tokens nahi mile — na env mein, na '{APP_TOKENS_FILE}' mein.")
-
-    seen, clean = set(), []
-    for t in tokens:
-        if t and t not in seen:
-            seen.add(t)
-            clean.append(t)
-    if not clean:
-        die(f"{src} mein ek bhi valid app token nahi mila.")
-    log.info("App tokens: %d unique (%s)", len(clean), src)
-    return clean
-
-
-def chunked(seq, size):
+def chunked(seq: list[Any], size: int) -> Iterable[list[Any]]:
     if size <= 0:
         yield seq
         return
@@ -383,492 +424,1019 @@ def chunked(seq, size):
         yield seq[i:i + size]
 
 
-# ─── ADJUST API ────────────────────────────────────────────────────────────
-RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+def parse_date_env(value: str, name: str) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        die(f"{name} must be YYYY-MM-DD, got {value!r}")
 
 
-def call_adjust(params, label, quiet=False):
-    """
-    Returns (body, error_text).
-      body=dict → kaamyab
-      body=None → nakaam (error_text mein wajah)
-
-    🛡️ #10 — body HAMESHA pehle parse hoti hai, status dekhne se pehle.
-    🛡️ #2  — nakami pe None (khali list NAHI).
-    🛡️ #3  — har call pe REQUEST_TIMEOUT.
-    🛡️ #8  — aarzi errors pe retry + backoff.
-    """
-    headers = {"Authorization": f"Bearer {ADJUST_API_TOKEN}",
-               "Accept": "application/json"}
-
-    for attempt in range(1, MAX_RETRIES + 1):
+def derive_store_keys(store_id: Any, store_type: Any, os_name: Any):
+    sid = _clean(store_id)
+    if not sid:
+        return None, None, None
+    os_l = (_clean(os_name) or "").lower()
+    st_l = (_clean(store_type) or "").lower()
+    if "amazon" in st_l:
+        return None, None, sid.upper()
+    is_ios = "ios" in os_l or "app_store" in st_l or "itunes" in st_l
+    is_android = "android" in os_l or "google" in st_l or "play" in st_l
+    if sid.isdigit():
+        if is_android:
+            return None, None, None
         try:
-            r = requests.get(ADJUST_ENDPOINT, headers=headers,
-                             params=params, timeout=REQUEST_TIMEOUT)
-            try:
-                body = r.json()
-            except ValueError:
-                body = None
-
-            if r.status_code == 200 and isinstance(body, dict):
-                return body, ""
-
-            detail = ""
-            if isinstance(body, dict):
-                detail = (body.get("error") or body.get("message")
-                          or body.get("detail") or json.dumps(body))[:300]
-            else:
-                detail = (r.text or "")[:300]
-
-            if r.status_code in (401, 403):
-                die(f"HTTP {r.status_code} — ADJUST_API_TOKEN galat hai ya "
-                    f"permission nahi: {detail}")
-
-            if r.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
-                wait = min(30 * attempt, 300)
-                if not quiet:
-                    log.warning("  %s: HTTP %s — %ss wait, retry %d/%d",
-                                label, r.status_code, wait, attempt, MAX_RETRIES)
-                    log.warning("    Adjust: %s", detail[:200])
-                time.sleep(wait)
-                continue
-
-            return None, f"HTTP {r.status_code}: {detail}"
-
-        except requests.exceptions.RequestException as exc:
-            if attempt < MAX_RETRIES:
-                wait = min(30 * attempt, 300)
-                if not quiet:
-                    log.warning("  %s: network — %ss wait, retry %d/%d: %s",
-                                label, wait, attempt, MAX_RETRIES, exc)
-                time.sleep(wait)
-                continue
-            return None, f"network: {exc}"
-
-    return None, "retries khatam"
+            return None, int(sid), None
+        except ValueError:
+            return None, None, None
+    if "." in sid:
+        if is_ios:
+            return None, None, None
+        return sid.lower(), None, None
+    return None, None, None
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  🤝 NEGOTIATION — "sab maango, jo mile wo lo, baqi LOG karo"
-# ══════════════════════════════════════════════════════════════════════════
-_NEG_CACHE = {}     # report_key → (dimensions, metrics)
-
-
-def _probe_one(dims, mets, token, period, label):
-    """Ek combo test karo. (ok, warnings) lauta do."""
-    body, err = call_adjust({
-        "app_token__in":    token,
-        "date_period":      period,
-        "dimensions":       ",".join(dims),
-        "metrics":          ",".join(mets),
-        "utc_offset":       UTC_OFFSET,
-        "attribution_type": ATTRIBUTION_TYPE,
-        "cohort_maturity":  COHORT_MATURITY,      # 🆕 v2.1
-    }, label, quiet=True)
-    if body is None:
-        return False, [err]
-    warns = [str(w) for w in (body.get("warnings") or [])]
-    if body.get("rows") is None:
-        return False, warns or ["'rows' key hi nahi aayi"]
-    return (not warns), warns
-
-
-def negotiate(report, token, period):
-    """
-    Pehle POORI list maango. Kaamyab → wahi use karo.
-    Nakaam → har dimension/metric ALAG test karke jo chale wahi rakho.
-
-    Nateeja cache hota hai: 141 apps ke liye dobara test nahi hota.
-    """
-    key = report["key"]
-    if key in _NEG_CACHE:
-        return _NEG_CACHE[key]
-
-    want_d = list(report["dimensions"])
-    want_m = list(ALL_METRICS)
-
-    log.info("🤝 [%s] negotiation — %d dimensions + %d metrics maang rahe hain",
-             key, len(want_d), len(want_m))
-
-    ok, warns = _probe_one(want_d, want_m, token, period, f"neg[{key}]")
-    if ok:
-        log.info("   ✅ Adjust ne POORI list qubool kar li")
-        _NEG_CACHE[key] = (want_d, want_m)
-        return _NEG_CACHE[key]
-
-    log.warning("   ⚠️  poori list qubool nahi hui — ek ek karke test kar rahe hain")
-    for w in warns[:3]:
-        log.warning("      %s", w[:200])
-
-    # ── dimensions: 'day' base, baqi ek ek ──
-    good_d, bad_d = ["day"], []
-    for d in want_d:
-        if d == "day":
-            continue
-        ok, _ = _probe_one(["day", d], ["installs"], token, period, d)
-        (good_d if ok else bad_d).append(d)
-        time.sleep(0.4)
-
-    # ── metrics: good dimensions ke saath ek ek ──
-    good_m, bad_m = [], []
-    for m in want_m:
-        ok, _ = _probe_one(["day"], [m], token, period, m)
-        (good_m if ok else bad_m).append(m)
-        time.sleep(0.4)
-
-    if not good_m:
-        die(f"[{key}] ek bhi metric qubool nahi hua — aage badhna bekaar hai.")
-
-    log.info("   ✅ [%s] chale — dimensions %d/%d, metrics %d/%d",
-             key, len(good_d), len(want_d), len(good_m), len(want_m))
-    if bad_d:
-        log.warning("   ❌ [%s] dimensions jo NAHI chale (%d): %s",
-                    key, len(bad_d), ", ".join(bad_d))
-    if bad_m:
-        log.warning("   ❌ [%s] metrics jo NAHI chale (%d): %s",
-                    key, len(bad_m), ", ".join(bad_m))
-
-    _NEG_CACHE[key] = (good_d, good_m)
-    return _NEG_CACHE[key]
-
-
-# ─── SCHEMA (negotiation ke mutabiq banti hai) ─────────────────────────────
-DERIVED_FIELDS = [
-    bigquery.SchemaField("android_package", "STRING",
-                         description="DERIVED store_id se — app_master_v2.android_package"),
-    bigquery.SchemaField("apple_id", "INTEGER",
-                         description="DERIVED store_id se — app_master_v2.apple_id"),
-    bigquery.SchemaField("amazon_asin", "STRING",
-                         description="DERIVED store_id se — app_master_v2.amazon_asin"),
-]
-AUDIT_FIELDS = [
-    bigquery.SchemaField("_ingested_at", "TIMESTAMP", mode="REQUIRED"),
-    bigquery.SchemaField("_run_id", "STRING"),
-]
-
-
-def build_schema(dimensions, metrics):
-    """Sirf un columns ki schema jo Adjust ne WAQAI di — khali columns nahi."""
-    fields = []
-    for d in dimensions:
-        if d == "day":
-            fields.append(bigquery.SchemaField("date", "DATE", mode="REQUIRED"))
-        elif d == "app_token":
-            # 🔧 v2.1 FIX — app_token LAZMI hai: DELETE guard isi par chalta hai,
-            #    aur maujooda tables mein ye REQUIRED bana hua hai. NULLABLE
-            #    chhodne se BigQuery 400 deta hai:
-            #      "Field app_token has changed mode from REQUIRED to NULLABLE"
-            fields.append(bigquery.SchemaField("app_token", "STRING", mode="REQUIRED"))
-        else:
-            fields.append(bigquery.SchemaField(d, "STRING"))
-
-    # app_token har report mein lazmi hai — DELETE guard isi par chalta hai
-    if "app_token" not in dimensions:
-        fields.append(bigquery.SchemaField("app_token", "STRING", mode="REQUIRED"))
-
-    if "store_id" in dimensions:
-        fields.extend(DERIVED_FIELDS)
-
-    for m in metrics:
-        fields.append(bigquery.SchemaField(
-            m, "INTEGER" if m in INT_METRICS else "FLOAT"))
-
-    fields.extend(AUDIT_FIELDS)
-    return fields
-
-
-def parse_rows(raw_rows, dimensions, metrics, tokens, label):
-    """Adjust ke rows → BigQuery dicts."""
-    now_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-    out, skipped, no_key = [], 0, 0
-    has_store = "store_id" in dimensions
-
-    for r in raw_rows:
-        day = (r.get("day") or r.get("date") or "").strip()[:10]
-        tok = (r.get("app_token") or "").strip()
-        # 🛡️ Key ke bagair row bemaani hai — DELETE guard bhi us par nahi chalega
-        if not day or not tok:
-            skipped += 1
-            continue
-
-        row = {"date": day, "app_token": tok}
-        for d in dimensions:
-            if d in ("day", "app_token"):
-                continue
-            row[d] = _clean(r.get(d))
-
-        if has_store:
-            ap, ai, az = derive_store_keys(
-                r.get("store_id"), r.get("store_type"), r.get("os_name"))
-            row["android_package"] = ap
-            row["apple_id"]        = ai
-            row["amazon_asin"]     = az
-            if not (ap or ai or az):
-                no_key += 1
-
-        for m in metrics:
-            row[m] = _to_int(r.get(m)) if m in INT_METRICS else _to_float(r.get(m))
-
-        row["_ingested_at"] = now_iso
-        row["_run_id"]      = RUN_ID
-        out.append(row)
-
-    if skipped:
-        log.warning("  %s: %d rows chhodi (day/app_token khali)", label, skipped)
-    if no_key:
-        log.warning("  %s: %d rows mein koi store key nahi (unmapped rahenge)",
-                    label, no_key)
+def load_app_tokens() -> list[str]:
+    if APP_TOKENS_ENV.strip():
+        raw = [x.strip() for x in APP_TOKENS_ENV.split(",")]
+        source = "ADJUST_APP_TOKENS"
+    elif os.path.exists(APP_TOKENS_FILE):
+        with open(APP_TOKENS_FILE, "r", encoding="utf-8") as fh:
+            raw = [ln.split("#", 1)[0].strip() for ln in fh]
+        source = APP_TOKENS_FILE
+    else:
+        die(f"No app tokens: set ADJUST_APP_TOKENS or provide {APP_TOKENS_FILE}")
+    out: list[str] = []
+    seen = set()
+    for t in raw:
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    if not out:
+        die(f"No valid app tokens in {source}")
+    log.info("Apps: %d unique tokens (%s)", len(out), source)
     return out
 
 
-def fetch_chunk(report, tokens, start, end, dimensions, metrics, label):
-    """
-    Ek chunk ka data. Returns (rows, ok_tokens).
-    🛡️ #2 — nakami pe (None, set()) — in apps ka purana data CHHUA NAHI jayega.
-    """
-    body, err = call_adjust({
-        "app_token__in":    ",".join(tokens),
-        "date_period":      f"{start.isoformat()}:{end.isoformat()}",
-        "dimensions":       ",".join(dimensions),
-        "metrics":          ",".join(metrics),
-        "utc_offset":       UTC_OFFSET,
-        "attribution_type": ATTRIBUTION_TYPE,
-        "cohort_maturity":  COHORT_MATURITY,      # 🆕 v2.1
-    }, label)
+def request_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {ADJUST_API_TOKEN}", "Accept": "application/json"}
 
+
+def http_get_json(url: str, params: dict[str, Any], label: str, quiet: bool = False):
+    """Return (json_body, error). 204 is a successful empty response."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = requests.get(url, headers=request_headers(), params=params, timeout=REQUEST_TIMEOUT)
+            if r.status_code == 204:
+                return {}, ""
+            body: Any = None
+            try:
+                body = r.json()
+            except ValueError:
+                pass
+
+            if r.status_code == 200:
+                return body, ""
+
+            if isinstance(body, dict):
+                detail = body.get("error") or body.get("message") or body.get("detail") or json.dumps(body)
+            else:
+                detail = r.text or ""
+            detail = str(detail)[:700]
+
+            if r.status_code in (401, 403):
+                die(f"Adjust HTTP {r.status_code}: token/permission problem: {detail}")
+
+            if r.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
+                retry_after = r.headers.get("Retry-After")
+                wait = int(retry_after) if retry_after and retry_after.isdigit() else min(5 * (2 ** (attempt - 1)), 120)
+                if not quiet:
+                    log.warning("%s HTTP %s; retry %d/%d in %ss", label, r.status_code, attempt, MAX_RETRIES, wait)
+                time.sleep(wait)
+                continue
+            return None, f"HTTP {r.status_code}: {detail}"
+        except requests.exceptions.RequestException as exc:
+            if attempt < MAX_RETRIES:
+                wait = min(5 * (2 ** (attempt - 1)), 120)
+                if not quiet:
+                    log.warning("%s network error; retry %d/%d in %ss: %s", label, attempt, MAX_RETRIES, wait, exc)
+                time.sleep(wait)
+                continue
+            return None, f"network: {exc}"
+    return None, "retries exhausted"
+
+
+def base_report_params(tokens: list[str], start: date, end: date, dimensions: list[str], metrics: list[str],
+                       *, ad_spend_mode: str | None = None, cohort_maturity: str | None = None) -> dict[str, Any]:
+    p: dict[str, Any] = {
+        "app_token__in": ",".join(tokens),
+        "date_period": f"{start.isoformat()}:{end.isoformat()}",
+        "dimensions": ",".join(dimensions),
+        "metrics": ",".join(metrics),
+        "utc_offset": UTC_OFFSET,
+        "format_dates": "false",
+        "currency": REPORTING_CURRENCY,
+        "attribution_source": ATTRIBUTION_SOURCE,
+    }
+    if ATTRIBUTION_TYPES:
+        p["attribution_types"] = ",".join(ATTRIBUTION_TYPES)
+    if ad_spend_mode:
+        p["ad_spend_mode"] = ad_spend_mode
+    if cohort_maturity:
+        p["cohort_maturity"] = cohort_maturity
+    return p
+
+
+def report_call(tokens: list[str], start: date, end: date, dimensions: list[str], metrics: list[str], label: str,
+                *, ad_spend_mode: str | None = None, cohort_maturity: str | None = None, quiet: bool = False):
+    params = base_report_params(tokens, start, end, dimensions, metrics,
+                                ad_spend_mode=ad_spend_mode, cohort_maturity=cohort_maturity)
+    body, err = http_get_json(REPORT_ENDPOINT, params, label, quiet=quiet)
     if body is None:
-        log.error("  %s: %s", label, err)
-        return None, set()
+        return None, err, []
+    if body == {}:
+        return [], "", []
+    if not isinstance(body, dict):
+        return None, "unexpected non-object report response", []
+    warnings = [str(w) for w in (body.get("warnings") or [])]
+    rows = body.get("rows")
+    if rows is None:
+        return None, "response missing rows", warnings
+    if not isinstance(rows, list):
+        return None, "response rows is not a list", warnings
+    return rows, "", warnings
 
-    for w in (body.get("warnings") or []):
-        log.warning("  %s: Adjust warning — %s", label, str(w)[:200])
+# -----------------------------------------------------------------------------
+# Adjust catalog discovery
+# -----------------------------------------------------------------------------
+def discover_filters() -> dict[str, list[dict[str, Any]]]:
+    wanted = [
+        "dimensions", "full_cohort_periods", "attribution_types", "ad_spend_mode",
+        "cohort_maturity", "currencies", "apps", "apps_network", "attributes",
+        "store_type", "os_names", "platform", "partners", "networks",
+        "ad_revenue_sources", "iap_revenue_mode", "subscription_revenue_mode",
+    ]
+    body, err = http_get_json(FILTERS_ENDPOINT, {"required_filters": ",".join(wanted)}, "filters_data")
+    if body is None:
+        log.warning("Filters Data discovery failed: %s", err)
+        return {}
+    if not isinstance(body, dict):
+        log.warning("Filters Data response not an object")
+        return {}
+    out: dict[str, list[dict[str, Any]]] = {}
+    for k, v in body.items():
+        if isinstance(v, list):
+            out[k] = [x for x in v if isinstance(x, dict)]
+    return out
 
-    raw = body.get("rows")
-    if raw is None:
-        log.error("  %s: response mein 'rows' key nahi", label)
-        return None, set()
 
-    rows = parse_rows(raw, dimensions, metrics, tokens, label)
-    log.info("  %s: %s rows, %d apps", label, f"{len(rows):,}",
-             len({r['app_token'] for r in rows}))
-    return rows, set(tokens)
+def discover_events(tokens: list[str]) -> list[dict[str, Any]]:
+    body, err = http_get_json(EVENTS_ENDPOINT, {
+        "app_token__in": ",".join(tokens),
+        "tokens_mapping": "true",
+    }, "events")
+    if body is None:
+        log.warning("Events discovery failed: %s", err)
+        return []
+    if not isinstance(body, list):
+        log.warning("Events endpoint returned unexpected shape: %s", type(body).__name__)
+        return []
+    return [x for x in body if isinstance(x, dict) and _clean(x.get("id"))]
 
 
-# ─── BIGQUERY ──────────────────────────────────────────────────────────────
-def get_bq_client():
-    if not GCP_CREDENTIALS_JSON.strip():
-        die("GCP_CREDENTIALS_JSON env khali hai.")
+def catalog_ids(filters: dict[str, list[dict[str, Any]]], key: str) -> set[str]:
+    return {str(x.get("id")) for x in filters.get(key, []) if x.get("id") is not None}
+
+
+def choose_dimensions(desired: list[str], filters: dict[str, list[dict[str, Any]]]) -> list[str]:
+    available = catalog_ids(filters, "dimensions")
+    # If discovery failed, use documented desired list and let report negotiation catch issues.
+    if not available:
+        return desired[:]
+    return [d for d in desired if d in available]
+
+
+def normalize_period_id(x: str) -> str | None:
+    s = str(x).strip().lower().replace(" ", "")
+    # Accept d7, 7d, w3, 3w, m2, 2m.
+    m = re.fullmatch(r"([dwm])(\d+)", s)
+    if m:
+        return f"{m.group(1)}{int(m.group(2))}"
+    m = re.fullmatch(r"(\d+)([dwm])", s)
+    if m:
+        return f"{m.group(2)}{int(m.group(1))}"
+    return None
+
+
+def discovered_periods(filters: dict[str, list[dict[str, Any]]]) -> list[str]:
+    out: set[str] = set()
+    for item in filters.get("full_cohort_periods", []):
+        for value in (item.get("id"), item.get("name"), item.get("short_name")):
+            p = normalize_period_id(str(value or ""))
+            if p:
+                out.add(p)
+    # Guaranteed documented fallback.
+    if not out:
+        out.update(f"d{i}" for i in range(121))
+        if INCLUDE_WEEKLY_MONTHLY_COHORTS:
+            out.update(f"w{i}" for i in range(53))
+            out.update(f"m{i}" for i in range(37))
+    return sorted(out, key=period_sort_key)
+
+
+def period_sort_key(p: str):
+    unit = p[0]
+    n = int(p[1:])
+    return ({"d": 0, "w": 1, "m": 2}.get(unit, 9), n)
+
+
+def select_periods(setting: str, available: list[str]) -> list[str]:
+    key = ["d0", "d1", "d3", "d7", "d14", "d30", "d60", "d90", "d120"]
+    if setting in ("all", "all_days"):
+        chosen = [p for p in available if p.startswith("d")]
+    elif setting == "all_periods":
+        chosen = available[:]
+    elif setting == "key":
+        chosen = [p for p in key if p in set(available)]
+    else:
+        requested = [normalize_period_id(x) for x in setting.split(",")]
+        chosen = [p for p in requested if p and p in set(available)]
+    return chosen or [p for p in key if p in set(available)]
+
+# -----------------------------------------------------------------------------
+# Negotiation
+# -----------------------------------------------------------------------------
+_NEG_DIM_CACHE: dict[tuple[str, ...], list[str]] = {}
+_NEG_METRIC_CACHE: dict[tuple[tuple[str, ...], tuple[str, ...], str, str], list[str]] = {}
+
+
+def warnings_are_problem(warnings: list[str]) -> bool:
+    if not warnings:
+        return False
+    text = " ".join(warnings).lower()
+    suspicious = ["invalid", "unsupported", "unknown", "not available", "not supported", "metric", "dimension"]
+    return any(x in text for x in suspicious)
+
+
+def negotiate_dimensions(dimensions: list[str], token: str, sample_start: date, sample_end: date) -> list[str]:
+    key = tuple(dimensions)
+    if key in _NEG_DIM_CACHE:
+        return _NEG_DIM_CACHE[key]
+    if "day" not in dimensions:
+        dimensions = ["day"] + dimensions
+    good = ["day"]
+    for d in dimensions:
+        if d == "day":
+            continue
+        rows, err, warns = report_call([token], sample_start, sample_end, ["day", d], ["installs"], f"probe_dim:{d}", quiet=True)
+        if rows is not None and not warnings_are_problem(warns):
+            good.append(d)
+        else:
+            log.warning("Dimension not usable: %s (%s %s)", d, err, warns[:1])
+        time.sleep(0.08)
+    # app_token is required for safe warehouse replacement. If unavailable, abort.
+    if "app_token" in dimensions and "app_token" not in good:
+        die("Adjust did not accept app_token dimension; cannot safely scope BigQuery replacement")
+    _NEG_DIM_CACHE[key] = good
+    return good
+
+
+def metric_batch_supported(dimensions: list[str], metrics: list[str], token: str,
+                           sample_start: date, sample_end: date, *,
+                           ad_spend_mode: str, cohort_maturity: str | None) -> bool:
+    rows, err, warns = report_call(
+        [token], sample_start, sample_end, dimensions, metrics,
+        f"probe_metrics[{len(metrics)}]", ad_spend_mode=ad_spend_mode,
+        cohort_maturity=cohort_maturity, quiet=True,
+    )
+    return rows is not None and not warnings_are_problem(warns)
+
+
+def negotiate_metrics(dimensions: list[str], candidates: list[str], token: str,
+                      sample_start: date, sample_end: date, *,
+                      ad_spend_mode: str, cohort_maturity: str | None) -> list[str]:
+    # Cache only on the exact candidate universe/config.
+    ck = (tuple(dimensions), tuple(candidates), ad_spend_mode or "", cohort_maturity or "")
+    if ck in _NEG_METRIC_CACHE:
+        return _NEG_METRIC_CACHE[ck]
+
+    def split_probe(items: list[str]) -> list[str]:
+        if not items:
+            return []
+        if metric_batch_supported(dimensions, items, token, sample_start, sample_end,
+                                  ad_spend_mode=ad_spend_mode, cohort_maturity=cohort_maturity):
+            return items
+        if len(items) == 1:
+            return []
+        mid = len(items) // 2
+        return split_probe(items[:mid]) + split_probe(items[mid:])
+
+    supported: list[str] = []
+    for batch in chunked(list(dict.fromkeys(candidates)), METRIC_BATCH_SIZE):
+        supported.extend(split_probe(batch))
+        time.sleep(0.1)
+    supported = list(dict.fromkeys(supported))
+    dropped = [m for m in candidates if m not in set(supported)]
+    log.info("Metrics supported %d/%d", len(supported), len(candidates))
+    if dropped:
+        log.info("Unsupported/plan-gated metric candidates (%d): %s%s",
+                 len(dropped), ", ".join(dropped[:30]), " ..." if len(dropped) > 30 else "")
+    _NEG_METRIC_CACHE[ck] = supported
+    return supported
+
+# -----------------------------------------------------------------------------
+# Fetch + merge metric chunks
+# -----------------------------------------------------------------------------
+def dim_key(row: dict[str, Any], dimensions: list[str]) -> tuple[Any, ...]:
+    return tuple(_clean(row.get(d)) for d in dimensions)
+
+
+def fetch_merged(tokens: list[str], start: date, end: date, dimensions: list[str], metrics: list[str], label: str,
+                 *, ad_spend_mode: str, cohort_maturity: str | None = None):
+    """Fetch metric batches and merge them by requested dimensions.
+
+    Returns None on any batch failure. Returns [] on a successful zero-row result.
+    """
+    merged: dict[tuple[Any, ...], dict[str, Any]] = {}
+    any_success = False
+    for i, batch in enumerate(chunked(metrics, METRIC_BATCH_SIZE), 1):
+        rows, err, warns = report_call(
+            tokens, start, end, dimensions, batch,
+            f"{label}:metric_batch {i}", ad_spend_mode=ad_spend_mode,
+            cohort_maturity=cohort_maturity,
+        )
+        if rows is None:
+            log.error("%s failed: %s", label, err)
+            return None
+        any_success = True
+        for w in warns:
+            log.warning("%s Adjust warning: %s", label, w[:500])
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            k = dim_key(raw, dimensions)
+            rec = merged.setdefault(k, {d: raw.get(d) for d in dimensions})
+            # attr_dependency can contain IDs even when a top-level field is absent.
+            dep = raw.get("attr_dependency")
+            if isinstance(dep, dict):
+                for d in dimensions:
+                    if rec.get(d) in (None, "", "unknown", "missing") and d in dep:
+                        rec[d] = dep.get(d)
+            for m in batch:
+                if m in raw:
+                    rec[m] = raw.get(m)
+        time.sleep(0.05)
+    if not any_success:
+        return None
+    return list(merged.values())
+
+# -----------------------------------------------------------------------------
+# BigQuery schema / loading
+# -----------------------------------------------------------------------------
+def get_bq_client() -> bigquery.Client:
+    if not GCP_CREDENTIALS_JSON:
+        die("GCP_CREDENTIALS_JSON is empty")
     try:
         info = json.loads(GCP_CREDENTIALS_JSON)
     except json.JSONDecodeError as exc:
-        die(f"GCP_CREDENTIALS_JSON valid JSON nahi: {exc}")
-    if not isinstance(info, dict):
-        die("GCP_CREDENTIALS_JSON JSON object hona chahiye.")
-
-    REQUIRED = ["type", "project_id", "private_key_id", "private_key",
-                "client_email", "token_uri"]
-    missing = [k for k in REQUIRED if not str(info.get(k, "")).strip()]
-    if missing:
-        log.error("GCP_CREDENTIALS_JSON mein ye fields nahi mile: %s", missing)
-        log.error("Jo fields mile: %s", sorted(info.keys()))
-        log.error("Sahi cheez: GCP se DOWNLOAD ki hui poori .json key file")
-        log.error("  IAM & Admin → Service Accounts → Keys → Add key → JSON")
-        die("Service-account JSON adhoori hai.")
-    if "BEGIN PRIVATE KEY" not in info["private_key"]:
-        die("private_key adhoora lagta hai (BEGIN PRIVATE KEY nahi mila).")
-
-    log.info("Service account: %s (project %s)",
-             info.get("client_email"), info.get("project_id"))
+        die(f"GCP_CREDENTIALS_JSON invalid: {exc}")
     creds = service_account.Credentials.from_service_account_info(
         info, scopes=["https://www.googleapis.com/auth/cloud-platform"])
-    return bigquery.Client(project=GCP_PROJECT, credentials=creds,
-                           location=BQ_LOCATION)
+    return bigquery.Client(project=GCP_PROJECT, credentials=creds, location=BQ_LOCATION)
 
 
-def ensure_table(client, table_name, schema, cluster):
+def ensure_dataset(client: bigquery.Client) -> None:
     ds_ref = f"{GCP_PROJECT}.{BQ_DATASET}"
     try:
         client.get_dataset(ds_ref)
     except gexc.NotFound:
-        log.info("Dataset %s bana rahe hain (%s)", ds_ref, BQ_LOCATION)
         ds = bigquery.Dataset(ds_ref)
         ds.location = BQ_LOCATION
         client.create_dataset(ds)
+        log.info("Created dataset %s", ds_ref)
 
-    tbl_ref = f"{ds_ref}.{table_name}"
+
+def schema_for_flat(dimensions: list[str], metrics: list[str], *, extra_fields: list[bigquery.SchemaField] | None = None):
+    fields: list[bigquery.SchemaField] = []
+    for d in dimensions:
+        if d == "day":
+            fields.append(bigquery.SchemaField("date", "DATE", mode="REQUIRED"))
+        elif d == "app_token":
+            fields.append(bigquery.SchemaField("app_token", "STRING", mode="REQUIRED"))
+        else:
+            fields.append(bigquery.SchemaField(d, "STRING"))
+    if "store_id" in dimensions:
+        fields += [
+            bigquery.SchemaField("android_package", "STRING"),
+            bigquery.SchemaField("apple_id", "INTEGER"),
+            bigquery.SchemaField("amazon_asin", "STRING"),
+        ]
+    for m in metrics:
+        fields.append(bigquery.SchemaField(m, "FLOAT"))
+    if extra_fields:
+        fields.extend(extra_fields)
+    fields += [
+        bigquery.SchemaField("_ingested_at", "TIMESTAMP", mode="REQUIRED"),
+        bigquery.SchemaField("_run_id", "STRING", mode="REQUIRED"),
+    ]
+    return dedupe_schema(fields)
+
+
+def dedupe_schema(fields: list[bigquery.SchemaField]) -> list[bigquery.SchemaField]:
+    out = []
+    seen = set()
+    for f in fields:
+        if f.name not in seen:
+            seen.add(f.name)
+            out.append(f)
+    return out
+
+
+def cohort_schema(dimensions: list[str], fields: list[str], *, event: bool = False):
+    schema = schema_for_flat(dimensions, [], extra_fields=[
+        bigquery.SchemaField("cohort_period", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("cohort_maturity", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("ad_spend_mode", "STRING", mode="REQUIRED"),
+    ])
+    # Insert event metadata before metrics if event cohort table.
+    if event:
+        # rebuild before audit columns for readability, but BigQuery doesn't care.
+        schema = [f for f in schema if f.name not in ("_ingested_at", "_run_id")]
+        schema += [
+            bigquery.SchemaField("event_slug", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("event_name", "STRING"),
+            bigquery.SchemaField("event_short_name", "STRING"),
+        ]
+    for x in fields:
+        schema.append(bigquery.SchemaField(x, "FLOAT"))
+    if event:
+        schema += [
+            bigquery.SchemaField("_ingested_at", "TIMESTAMP", mode="REQUIRED"),
+            bigquery.SchemaField("_run_id", "STRING", mode="REQUIRED"),
+        ]
+    return dedupe_schema(schema)
+
+
+def ensure_table(client: bigquery.Client, table_name: str, schema: list[bigquery.SchemaField], cluster: list[str]) -> str:
+    ensure_dataset(client)
+    ref = f"{GCP_PROJECT}.{BQ_DATASET}.{table_name}"
     names = {f.name for f in schema}
-    cl = [c if c != "day" else "date" for c in cluster if c in names][:4]
-
+    cluster_fields = [x for x in cluster if x in names][:4]
     try:
-        table = client.get_table(tbl_ref)
+        table = client.get_table(ref)
     except gexc.NotFound:
-        log.info("Table %s bana rahe hain (partition: date, cluster: %s)",
-                 tbl_ref, cl)
-        t = bigquery.Table(tbl_ref, schema=schema)
-        t.time_partitioning = bigquery.TimePartitioning(
-            type_=bigquery.TimePartitioningType.DAY, field="date")
-        if cl:
-            t.clustering_fields = cl
-        client.create_table(t)
-        return tbl_ref
+        table = bigquery.Table(ref, schema=schema)
+        table.time_partitioning = bigquery.TimePartitioning(type_=bigquery.TimePartitioningType.DAY, field="date")
+        if cluster_fields:
+            table.clustering_fields = cluster_fields
+        client.create_table(table)
+        log.info("Created %s", ref)
+        return ref
 
-    # schema align — sirf ADD, kabhi drop/badal nahi
-    have = {f.name for f in table.schema}
-    add = [bigquery.SchemaField(f.name, f.field_type, mode="NULLABLE",
-                                description=f.description)
-           for f in schema if f.name not in have]
-    if add:
-        log.info("Schema align [%s]: %d naye column — %s",
-                 table_name, len(add), [f.name for f in add])
-        table.schema = list(table.schema) + add
+    have = {f.name: f for f in table.schema}
+    new_fields = []
+    for f in schema:
+        if f.name not in have:
+            new_fields.append(bigquery.SchemaField(f.name, f.field_type, mode="NULLABLE", description=f.description))
+    if new_fields:
+        table.schema = list(table.schema) + new_fields
         client.update_table(table, ["schema"])
-
-    extra = have - names
-    if extra:
-        log.warning("[%s] table mein extra columns (chhode ja rahe hain): %s",
-                    table_name, sorted(extra))
-    return tbl_ref
+        log.info("%s schema +%d fields", table_name, len(new_fields))
+    return ref
 
 
-def replace_window(client, tbl_ref, table_name, rows, schema,
-                   ok_tokens, start, end, all_ok):
+def parse_flat_rows(raw_rows: list[dict[str, Any]], dimensions: list[str], metrics: list[str], *, extras: dict[str, Any] | None = None):
+    now = datetime.now(timezone.utc).isoformat()
+    out: list[dict[str, Any]] = []
+    for raw in raw_rows:
+        day = str(raw.get("day") or raw.get("date") or "")[:10]
+        tok = str(raw.get("app_token") or "").strip()
+        if not day or not tok:
+            continue
+        row: dict[str, Any] = {"date": day, "app_token": tok}
+        for d in dimensions:
+            if d in ("day", "app_token"):
+                continue
+            row[d] = _clean(raw.get(d))
+        if "store_id" in dimensions:
+            ap, ai, az = derive_store_keys(raw.get("store_id"), raw.get("store_type"), raw.get("os_name"))
+            row["android_package"], row["apple_id"], row["amazon_asin"] = ap, ai, az
+        for m in metrics:
+            if m in raw:
+                row[m] = _num(raw.get(m))
+        if extras:
+            row.update(extras)
+        row["_ingested_at"] = now
+        row["_run_id"] = RUN_ID
+        out.append(row)
+    return out
+
+
+def safe_ident(name: str) -> str:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        raise ValueError(f"Unsafe BigQuery identifier: {name}")
+    return name
+
+
+def atomic_replace_window(client: bigquery.Client, table_name: str, rows: list[dict[str, Any]],
+                          schema: list[bigquery.SchemaField], ok_tokens: set[str], start: date, end: date,
+                          *, cluster: list[str], extra_delete_sql: str = "", extra_query_params: list[Any] | None = None):
+    """Load staging first, then DELETE+INSERT inside one BigQuery transaction.
+
+    Empty successful result intentionally deletes stale data for the successful apps/window.
     """
-    🛡️ #1 — DELETE sirf un apps ka jo IS RUN mein aaye.
-    🛡️ #7 — load job (streaming NAHI) + row-count verify.
-    """
-    if not rows:
-        log.warning("  [%s] 0 rows — DELETE/LOAD kuch nahi (purana mehfooz)",
-                    table_name)
-        return
     if not ok_tokens:
-        record_failure(table_name, "ok_tokens khali — kuch nahi kiya")
+        record_failure(table_name, "no successful app tokens")
         return
-
-    ok_list = sorted(ok_tokens)
-    try:
-        client.query(
-            f"""DELETE FROM `{tbl_ref}`
-                WHERE date BETWEEN @start AND @end
-                  AND app_token IN UNNEST(@ok)""",
-            job_config=bigquery.QueryJobConfig(query_parameters=[
-                bigquery.ScalarQueryParameter("start", "DATE", start.isoformat()),
-                bigquery.ScalarQueryParameter("end", "DATE", end.isoformat()),
-                bigquery.ArrayQueryParameter("ok", "STRING", ok_list),
-            ])).result()
-        log.info("  [%s] cleared %s → %s for %d apps%s",
-                 table_name, start, end, len(ok_list),
-                 "" if all_ok else "  ⚠️ (kuch chunk fail — baqi apps CHHUE NAHI)")
-    except Exception as exc:
-        record_failure(f"delete[{table_name}]", exc)
-        return
+    target = ensure_table(client, table_name, schema, cluster)
+    cols = [safe_ident(f.name) for f in schema]
+    run_suffix = re.sub(r"[^A-Za-z0-9_]", "_", RUN_ID)[-80:]
+    staging_name = f"{table_name}__stg_{run_suffix}"
+    staging = f"{GCP_PROJECT}.{BQ_DATASET}.{staging_name}"
 
     try:
-        job = client.load_table_from_json(
-            rows, tbl_ref,
-            job_config=bigquery.LoadJobConfig(
-                schema=schema,
-                write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-                source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON))
-        job.result()
-        loaded = job.output_rows
-    except Exception as exc:
-        record_failure(f"load[{table_name}]", exc)
-        return
+        st = bigquery.Table(staging, schema=schema)
+        client.create_table(st, exists_ok=False)
+        if rows:
+            job = client.load_table_from_json(
+                rows, staging,
+                job_config=bigquery.LoadJobConfig(
+                    schema=schema,
+                    write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+                    source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+                ),
+            )
+            job.result()
+            if job.output_rows != len(rows):
+                raise RuntimeError(f"staging row mismatch expected={len(rows)} loaded={job.output_rows}")
 
-    if loaded != len(rows):
-        record_failure(table_name,
-                       f"row count mismatch — bheje {len(rows):,}, gaye {loaded:,}")
+        params: list[Any] = [
+            bigquery.ScalarQueryParameter("start", "DATE", start.isoformat()),
+            bigquery.ScalarQueryParameter("end", "DATE", end.isoformat()),
+            bigquery.ArrayQueryParameter("ok", "STRING", sorted(ok_tokens)),
+        ]
+        if extra_query_params:
+            params.extend(extra_query_params)
+        where_extra = f"\n AND {extra_delete_sql}" if extra_delete_sql else ""
+        col_sql = ", ".join(f"`{c}`" for c in cols)
+        sql = f"""
+        BEGIN TRANSACTION;
+        DELETE FROM `{target}`
+         WHERE date BETWEEN @start AND @end
+           AND app_token IN UNNEST(@ok){where_extra};
+        INSERT INTO `{target}` ({col_sql})
+        SELECT {col_sql} FROM `{staging}`;
+        COMMIT TRANSACTION;
+        """
+        client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
+        log.info("✅ %s: replaced %s..%s for %d apps with %d rows", table_name, start, end, len(ok_tokens), len(rows))
+    except Exception as exc:
+        record_failure(f"atomic_replace[{table_name}]", exc)
+    finally:
+        try:
+            client.delete_table(staging, not_found_ok=True)
+        except Exception as exc:
+            log.warning("Could not delete staging %s: %s", staging, exc)
+
+# -----------------------------------------------------------------------------
+# Catalog BigQuery tables
+# -----------------------------------------------------------------------------
+def load_simple_snapshot(client: bigquery.Client, table_name: str, rows: list[dict[str, Any]], schema: list[bigquery.SchemaField]):
+    ensure_dataset(client)
+    ref = f"{GCP_PROJECT}.{BQ_DATASET}.{table_name}"
+    try:
+        client.get_table(ref)
+    except gexc.NotFound:
+        client.create_table(bigquery.Table(ref, schema=schema))
+    if rows:
+        client.load_table_from_json(rows, ref, job_config=bigquery.LoadJobConfig(
+            schema=schema, write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE)).result()
     else:
-        log.info("  ✅ [%s] %s rows (verified)", table_name, f"{loaded:,}")
+        client.query(f"TRUNCATE TABLE `{ref}`").result()
 
 
-# ─── MAIN ──────────────────────────────────────────────────────────────────
-def main():
-    log.info("🚀 Adjust → BigQuery  v2.0  ·  SAB KUCH EDITION")
+def persist_catalogs(client: bigquery.Client, filters: dict[str, list[dict[str, Any]]], events: list[dict[str, Any]], periods: list[str]):
+    if DRY_RUN:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    filter_rows = []
+    for kind, items in filters.items():
+        for item in items:
+            filter_rows.append({
+                "filter_type": kind,
+                "id": _clean(item.get("id")),
+                "name": _clean(item.get("name")),
+                "short_name": _clean(item.get("short_name")),
+                "section": _clean(item.get("section")),
+                "formatting": _clean(item.get("formatting")),
+                "description": _clean(item.get("description")),
+                "_ingested_at": now,
+            })
+    load_simple_snapshot(client, "adjust_filter_catalog", filter_rows, [
+        bigquery.SchemaField("filter_type", "STRING"), bigquery.SchemaField("id", "STRING"),
+        bigquery.SchemaField("name", "STRING"), bigquery.SchemaField("short_name", "STRING"),
+        bigquery.SchemaField("section", "STRING"), bigquery.SchemaField("formatting", "STRING"),
+        bigquery.SchemaField("description", "STRING"), bigquery.SchemaField("_ingested_at", "TIMESTAMP"),
+    ])
 
-    for name, val in (("ADJUST_API_TOKEN", ADJUST_API_TOKEN),
-                      ("GCP_PROJECT", GCP_PROJECT),
-                      ("GCP_CREDENTIALS_JSON", GCP_CREDENTIALS_JSON)):
-        if not val.strip():
-            die(f"Env var {name} set nahi hai.")
+    event_rows = []
+    for e in events:
+        event_rows.append({
+            "event_slug": _clean(e.get("id")), "event_name": _clean(e.get("name")),
+            "event_short_name": _clean(e.get("short_name")), "section": _clean(e.get("section")),
+            "formatting": _clean(e.get("formatting")), "is_skad_event": bool(e.get("is_skad_event")),
+            "app_tokens_json": json.dumps(e.get("app_token") or []),
+            "event_tokens_json": json.dumps(e.get("tokens") or []),
+            "mapping_json": json.dumps(e.get("app_token_x_event_tokens_mapping") or {}),
+            "_ingested_at": now,
+        })
+    load_simple_snapshot(client, "adjust_event_catalog", event_rows, [
+        bigquery.SchemaField("event_slug", "STRING"), bigquery.SchemaField("event_name", "STRING"),
+        bigquery.SchemaField("event_short_name", "STRING"), bigquery.SchemaField("section", "STRING"),
+        bigquery.SchemaField("formatting", "STRING"), bigquery.SchemaField("is_skad_event", "BOOLEAN"),
+        bigquery.SchemaField("app_tokens_json", "STRING"), bigquery.SchemaField("event_tokens_json", "STRING"),
+        bigquery.SchemaField("mapping_json", "STRING"), bigquery.SchemaField("_ingested_at", "TIMESTAMP"),
+    ])
+
+    period_rows = [{"cohort_period": p, "unit": p[0], "number": int(p[1:]), "_ingested_at": now} for p in periods]
+    load_simple_snapshot(client, "adjust_cohort_period_catalog", period_rows, [
+        bigquery.SchemaField("cohort_period", "STRING"), bigquery.SchemaField("unit", "STRING"),
+        bigquery.SchemaField("number", "INTEGER"), bigquery.SchemaField("_ingested_at", "TIMESTAMP"),
+    ])
+
+# -----------------------------------------------------------------------------
+# Base reports
+# -----------------------------------------------------------------------------
+def run_flat_report(client: bigquery.Client | None, report_key: str, tokens: list[str], start: date, end: date,
+                    filters: dict[str, list[dict[str, Any]]], sample_start: date, sample_end: date):
+    cfg = REPORTS[report_key]
+    dims = choose_dimensions(cfg["dimensions"], filters)
+    dims = negotiate_dimensions(dims, tokens[0], sample_start, sample_end)
+    candidates = SPEND_METRICS if report_key == "spend" else BASE_METRICS
+    modes = SPEND_RECON_MODES if report_key == "spend" else [AD_SPEND_MODE]
+
+    all_rows: list[dict[str, Any]] = []
+    ok_tokens: set[str] = set()
+    union_metrics: list[str] = []
+
+    for mode in modes:
+        supported = negotiate_metrics(dims, candidates, tokens[0], sample_start, sample_end,
+                                      ad_spend_mode=mode, cohort_maturity=None)
+        union_metrics.extend(supported)
+        for ci, app_chunk in enumerate(chunked(tokens, CHUNK_SIZE), 1):
+            raw = fetch_merged(app_chunk, start, end, dims, supported,
+                               f"{report_key}:{mode}:chunk{ci}", ad_spend_mode=mode)
+            if raw is None:
+                record_failure(f"{report_key}:{mode}:chunk{ci}", "fetch failed")
+                continue
+            parsed = parse_flat_rows(raw, dims, supported, extras={"ad_spend_mode": mode})
+            all_rows.extend(parsed)
+            ok_tokens.update(app_chunk)
+
+    union_metrics = list(dict.fromkeys(union_metrics))
+    schema = schema_for_flat(dims, union_metrics, extra_fields=[
+        bigquery.SchemaField("ad_spend_mode", "STRING", mode="REQUIRED")
+    ])
+    # Rows fetched under modes with fewer metrics simply leave missing nullable fields.
+    if DRY_RUN:
+        log.info("[DRY] %s rows=%d metrics=%d sample=%s", cfg["table"], len(all_rows), len(union_metrics), json.dumps(all_rows[:1], default=str)[:800])
+        return
+    assert client is not None
+    if report_key == "spend":
+        # Replace all configured modes in one transaction, so no extra filter needed.
+        atomic_replace_window(client, cfg["table"], all_rows, schema, ok_tokens, start, end,
+                              cluster=cfg["cluster"] + ["ad_spend_mode"])
+    else:
+        atomic_replace_window(client, cfg["table"], all_rows, schema, ok_tokens, start, end,
+                              cluster=cfg["cluster"] + ["ad_spend_mode"],
+                              extra_delete_sql="ad_spend_mode = @mode",
+                              extra_query_params=[bigquery.ScalarQueryParameter("mode", "STRING", AD_SPEND_MODE)])
+
+# -----------------------------------------------------------------------------
+# Cohort report (normalized LONG)
+# -----------------------------------------------------------------------------
+def build_cohort_metric_map(periods: list[str]):
+    slug_to_info: dict[str, tuple[str, str]] = {}
+    for p in periods:
+        for field, tmpl in COHORT_FAMILIES.items():
+            slug = tmpl.format(p=p)
+            slug_to_info[slug] = (p, field)
+    return slug_to_info
+
+
+def normalize_cohort_rows(raw_rows: list[dict[str, Any]], dimensions: list[str], supported_metrics: list[str],
+                          metric_map: dict[str, tuple[str, str]], maturity: str):
+    now = datetime.now(timezone.utc).isoformat()
+    out: list[dict[str, Any]] = []
+    supported_set = set(supported_metrics)
+    by_period: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for slug, (p, field) in metric_map.items():
+        if slug in supported_set:
+            by_period[p].append((slug, field))
+
+    for raw in raw_rows:
+        day = str(raw.get("day") or raw.get("date") or "")[:10]
+        tok = str(raw.get("app_token") or "").strip()
+        if not day or not tok:
+            continue
+        base = {"date": day, "app_token": tok}
+        for d in dimensions:
+            if d not in ("day", "app_token"):
+                base[d] = _clean(raw.get(d))
+        for p, mappings in by_period.items():
+            # Only create the period row if the API actually returned at least one metric key.
+            if not any(slug in raw for slug, _ in mappings):
+                continue
+            rec = dict(base)
+            rec["cohort_period"] = p
+            rec["cohort_maturity"] = maturity
+            rec["ad_spend_mode"] = AD_SPEND_MODE
+            for slug, field in mappings:
+                if slug in raw:
+                    rec[field] = _num(raw.get(slug))
+            rec["_ingested_at"] = now
+            rec["_run_id"] = RUN_ID
+            out.append(rec)
+    return out
+
+
+def run_cohort_report(client: bigquery.Client | None, tokens: list[str], start: date, end: date,
+                      filters: dict[str, list[dict[str, Any]]], periods: list[str], sample_start: date, sample_end: date):
+    dims = choose_dimensions(COHORT_DIMENSIONS, filters)
+    dims = negotiate_dimensions(dims, tokens[0], sample_start, sample_end)
+    metric_map = build_cohort_metric_map(periods)
+    candidates = list(metric_map.keys())
+    fields = list(COHORT_FAMILIES.keys())
+    schema = cohort_schema(dims, fields)
+    all_rows: list[dict[str, Any]] = []
+    ok_tokens: set[str] = set()
+
+    for maturity in COHORT_MATURITIES:
+        supported = negotiate_metrics(dims, candidates, tokens[0], sample_start, sample_end,
+                                      ad_spend_mode=AD_SPEND_MODE, cohort_maturity=maturity)
+        if not supported:
+            log.warning("No cohort metrics supported for maturity=%s", maturity)
+            continue
+        for ci, app_chunk in enumerate(chunked(tokens, CHUNK_SIZE), 1):
+            raw = fetch_merged(app_chunk, start, end, dims, supported,
+                               f"cohort:{maturity}:chunk{ci}", ad_spend_mode=AD_SPEND_MODE,
+                               cohort_maturity=maturity)
+            if raw is None:
+                record_failure(f"cohort:{maturity}:chunk{ci}", "fetch failed")
+                continue
+            all_rows.extend(normalize_cohort_rows(raw, dims, supported, metric_map, maturity))
+            ok_tokens.update(app_chunk)
+
+    if DRY_RUN:
+        log.info("[DRY] cohort rows=%d periods=%d sample=%s", len(all_rows), len(periods), json.dumps(all_rows[:1], default=str)[:900])
+        return
+    assert client is not None
+    atomic_replace_window(client, "cohort_daily_performance", all_rows, schema, ok_tokens, start, end,
+                          cluster=["app_token", "partner", "campaign_id_network", "cohort_period"])
+
+# -----------------------------------------------------------------------------
+# Event reports
+# -----------------------------------------------------------------------------
+def event_applies_to_token(event: dict[str, Any], token: str) -> bool:
+    app_tokens = event.get("app_token") or []
+    if isinstance(app_tokens, list) and app_tokens:
+        return token in app_tokens
+    mapping = event.get("app_token_x_event_tokens_mapping") or {}
+    if isinstance(mapping, dict) and mapping:
+        return token in mapping
+    return True
+
+
+def run_event_daily(client: bigquery.Client | None, tokens: list[str], start: date, end: date,
+                    filters: dict[str, list[dict[str, Any]]], events: list[dict[str, Any]], sample_start: date, sample_end: date):
+    dims = choose_dimensions(EVENT_DIMENSIONS, filters)
+    dims = negotiate_dimensions(dims, tokens[0], sample_start, sample_end)
+    schema = schema_for_flat(dims, ["event_count"], extra_fields=[
+        bigquery.SchemaField("event_slug", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("event_name", "STRING"),
+        bigquery.SchemaField("event_short_name", "STRING"),
+        bigquery.SchemaField("ad_spend_mode", "STRING", mode="REQUIRED"),
+    ])
+    all_rows: list[dict[str, Any]] = []
+    ok_tokens: set[str] = set()
+    now = datetime.now(timezone.utc).isoformat()
+
+    for ev_i, ev in enumerate(events, 1):
+        slug = _clean(ev.get("id"))
+        if not slug:
+            continue
+        metric = f"{slug}_events"
+        eligible_tokens = [t for t in tokens if event_applies_to_token(ev, t)]
+        if not eligible_tokens:
+            continue
+        supported = negotiate_metrics(dims, [metric], eligible_tokens[0], sample_start, sample_end,
+                                      ad_spend_mode=AD_SPEND_MODE, cohort_maturity=None)
+        if not supported:
+            continue
+        for ci, app_chunk in enumerate(chunked(eligible_tokens, CHUNK_SIZE), 1):
+            raw = fetch_merged(app_chunk, start, end, dims, supported,
+                               f"event:{slug}:chunk{ci}", ad_spend_mode=AD_SPEND_MODE)
+            if raw is None:
+                record_failure(f"event:{slug}:chunk{ci}", "fetch failed")
+                continue
+            for rr in raw:
+                day = str(rr.get("day") or rr.get("date") or "")[:10]
+                tok = str(rr.get("app_token") or "").strip()
+                if not day or not tok:
+                    continue
+                rec = {"date": day, "app_token": tok}
+                for d in dims:
+                    if d not in ("day", "app_token"):
+                        rec[d] = _clean(rr.get(d))
+                rec.update({
+                    "event_slug": slug,
+                    "event_name": _clean(ev.get("name")),
+                    "event_short_name": _clean(ev.get("short_name")),
+                    "event_count": _num(rr.get(metric)),
+                    "ad_spend_mode": AD_SPEND_MODE,
+                    "_ingested_at": now,
+                    "_run_id": RUN_ID,
+                })
+                all_rows.append(rec)
+            ok_tokens.update(app_chunk)
+        if ev_i % 25 == 0:
+            log.info("Event daily progress %d/%d", ev_i, len(events))
+
+    if DRY_RUN:
+        log.info("[DRY] event_daily rows=%d events=%d", len(all_rows), len(events))
+        return
+    assert client is not None
+    atomic_replace_window(client, "event_daily_performance", all_rows, schema, ok_tokens, start, end,
+                          cluster=["app_token", "event_slug", "partner", "campaign_id_network"])
+
+
+def build_event_cohort_metric_map(event_slug: str, periods: list[str]):
+    m: dict[str, tuple[str, str]] = {}
+    for p in periods:
+        for field, tmpl in EVENT_COHORT_FAMILIES.items():
+            slug = tmpl.format(e=event_slug, p=p)
+            m[slug] = (p, field)
+    return m
+
+
+def run_event_cohort(client: bigquery.Client | None, tokens: list[str], start: date, end: date,
+                     filters: dict[str, list[dict[str, Any]]], events: list[dict[str, Any]], periods: list[str],
+                     sample_start: date, sample_end: date):
+    dims = choose_dimensions(EVENT_DIMENSIONS, filters)
+    dims = negotiate_dimensions(dims, tokens[0], sample_start, sample_end)
+    schema = cohort_schema(dims, list(EVENT_COHORT_FAMILIES.keys()), event=True)
+    all_rows: list[dict[str, Any]] = []
+    ok_tokens: set[str] = set()
+    now = datetime.now(timezone.utc).isoformat()
+
+    for maturity in COHORT_MATURITIES:
+        for ev_i, ev in enumerate(events, 1):
+            slug = _clean(ev.get("id"))
+            if not slug:
+                continue
+            eligible_tokens = [t for t in tokens if event_applies_to_token(ev, t)]
+            if not eligible_tokens:
+                continue
+            metric_map = build_event_cohort_metric_map(slug, periods)
+            candidates = list(metric_map.keys())
+            supported = negotiate_metrics(dims, candidates, eligible_tokens[0], sample_start, sample_end,
+                                          ad_spend_mode=AD_SPEND_MODE, cohort_maturity=maturity)
+            if not supported:
+                continue
+            supported_set = set(supported)
+            by_period: dict[str, list[tuple[str, str]]] = defaultdict(list)
+            for metric_slug, (p, field) in metric_map.items():
+                if metric_slug in supported_set:
+                    by_period[p].append((metric_slug, field))
+
+            for ci, app_chunk in enumerate(chunked(eligible_tokens, CHUNK_SIZE), 1):
+                raw = fetch_merged(app_chunk, start, end, dims, supported,
+                                   f"event_cohort:{maturity}:{slug}:chunk{ci}",
+                                   ad_spend_mode=AD_SPEND_MODE, cohort_maturity=maturity)
+                if raw is None:
+                    record_failure(f"event_cohort:{maturity}:{slug}:chunk{ci}", "fetch failed")
+                    continue
+                for rr in raw:
+                    day = str(rr.get("day") or rr.get("date") or "")[:10]
+                    tok = str(rr.get("app_token") or "").strip()
+                    if not day or not tok:
+                        continue
+                    base = {"date": day, "app_token": tok}
+                    for d in dims:
+                        if d not in ("day", "app_token"):
+                            base[d] = _clean(rr.get(d))
+                    for p, mappings in by_period.items():
+                        if not any(ms in rr for ms, _ in mappings):
+                            continue
+                        rec = dict(base)
+                        rec.update({
+                            "cohort_period": p,
+                            "cohort_maturity": maturity,
+                            "ad_spend_mode": AD_SPEND_MODE,
+                            "event_slug": slug,
+                            "event_name": _clean(ev.get("name")),
+                            "event_short_name": _clean(ev.get("short_name")),
+                        })
+                        for ms, field in mappings:
+                            if ms in rr:
+                                rec[field] = _num(rr.get(ms))
+                        rec["_ingested_at"] = now
+                        rec["_run_id"] = RUN_ID
+                        all_rows.append(rec)
+                ok_tokens.update(app_chunk)
+            if ev_i % 10 == 0:
+                log.info("Event cohort [%s] progress %d/%d", maturity, ev_i, len(events))
+
+    if DRY_RUN:
+        log.info("[DRY] event_cohort rows=%d events=%d periods=%d", len(all_rows), len(events), len(periods))
+        return
+    assert client is not None
+    atomic_replace_window(client, "event_cohort_daily_performance", all_rows, schema, ok_tokens, start, end,
+                          cluster=["app_token", "event_slug", "cohort_period", "campaign_id_network"])
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+def main() -> None:
+    log.info("🚀 Adjust -> BigQuery v3.0 COMPLETE REPORTING WAREHOUSE")
+    for name, value in (
+        ("ADJUST_API_TOKEN", ADJUST_API_TOKEN),
+        ("GCP_PROJECT", GCP_PROJECT),
+        ("GCP_CREDENTIALS_JSON", GCP_CREDENTIALS_JSON),
+    ):
+        if not value:
+            die(f"Required env {name} is empty")
+
+    if AD_SPEND_MODE not in {"adjust", "network", "mixed"}:
+        die("AD_SPEND_MODE must be adjust, network or mixed")
+    bad_maturity = [x for x in COHORT_MATURITIES if x not in {"mature", "immature"}]
+    if bad_maturity:
+        die(f"Invalid COHORT_MATURITIES: {bad_maturity}")
 
     tokens = load_app_tokens()
-    end    = date.today() - timedelta(days=1)
-    start  = end - timedelta(days=LOOKBACK_DAYS - 1)
-    period = f"{start.isoformat()}:{end.isoformat()}"
+    filters = discover_filters()
+    events = discover_events(tokens)
+    all_periods = discovered_periods(filters)
+    cohort_periods = select_periods(COHORT_PERIODS_SETTING, all_periods)
+    event_periods = select_periods(EVENT_COHORT_PERIODS_SETTING, all_periods)
 
-    active = [r for r in REPORTS if r["key"] in ENABLED_REPORTS]
-    if not active:
-        die(f"REPORTS='{','.join(ENABLED_REPORTS)}' se koi report nahi mili. "
-            f"Mumkin: {', '.join(r['key'] for r in REPORTS)}")
+    # Explicit backfill override, otherwise rolling windows.
+    end_override = parse_date_env(END_DATE_ENV, "END_DATE")
+    start_override = parse_date_env(START_DATE_ENV, "START_DATE")
+    end = end_override or (date.today() - timedelta(days=1))
+    flat_start = start_override or (end - timedelta(days=max(LOOKBACK_DAYS, 1) - 1))
+    cohort_start = start_override or (end - timedelta(days=max(COHORT_LOOKBACK_DAYS, 1) - 1))
+    if flat_start > end or cohort_start > end:
+        die("Start date is after end date")
 
-    log.info("   Window : %s → %s  (%d din)", start, end, LOOKBACK_DAYS)
-    log.info("   Apps   : %d  |  chunk: %s", len(tokens),
-             CHUNK_SIZE if CHUNK_SIZE > 0 else "sab ek saath")
-    log.info("   Dataset: %s.%s (%s)", GCP_PROJECT, BQ_DATASET, BQ_LOCATION)
-    log.info("   DRY_RUN: %s  |  run_id: %s", DRY_RUN, RUN_ID)
-    log.info("   Reports:")
-    for r in active:
-        log.info("      • %-28s %s", r["table"], r["desc"])
+    # Probe the last few days. Recent data is more likely to exist.
+    sample_end = end
+    sample_start = max(date(2020, 1, 1), end - timedelta(days=6))
+
+    log.info("Flat window   : %s -> %s", flat_start, end)
+    log.info("Cohort window : %s -> %s", cohort_start, end)
+    log.info("Cohort periods: %d (%s..%s)", len(cohort_periods), cohort_periods[0], cohort_periods[-1])
+    log.info("Event periods : %d", len(event_periods))
+    log.info("Discovered events: %d", len(events))
+    log.info("Spend mode=%s | spend recon=%s | attribution_source=%s | currency=%s",
+             AD_SPEND_MODE, SPEND_RECON_MODES, ATTRIBUTION_SOURCE, REPORTING_CURRENCY)
+    log.info("Reports: %s", ",".join(ENABLED_REPORTS))
 
     client = None if DRY_RUN else get_bq_client()
+    if client:
+        persist_catalogs(client, filters, events, all_periods)
 
-    for report in active:
-        key, table = report["key"], report["table"]
-        log.info("")
-        log.info("═" * 74)
-        log.info("📊 %s  —  %s", table, report["desc"])
-        log.info("═" * 74)
+    # Base reports
+    for key in ("app", "campaign", "country", "spend"):
+        if key in ENABLED_REPORTS:
+            log.info("=" * 88)
+            log.info("📊 %s", key)
+            run_flat_report(client, key, tokens, flat_start, end, filters, sample_start, sample_end)
 
-        # 🤝 pehle tay karo ke Adjust is grain pe kya deta hai
-        dims, mets = negotiate(report, tokens[0], period)
-        schema = build_schema(dims, mets)
-        log.info("   Schema: %d columns (%d dimension + %d metric + derived/audit)",
-                 len(schema), len(dims), len(mets))
+    if "cohort" in ENABLED_REPORTS:
+        log.info("=" * 88)
+        log.info("📊 cohort D0-D120 normalized")
+        run_cohort_report(client, tokens, cohort_start, end, filters, cohort_periods, sample_start, sample_end)
 
-        all_rows, ok_tokens = [], set()
-        chunks = list(chunked(tokens, CHUNK_SIZE))
-        for i, chunk in enumerate(chunks, 1):
-            label = f"[{key}] chunk {i}/{len(chunks)} ({len(chunk)} apps)"
-            rows, ok = fetch_chunk(report, chunk, start, end, dims, mets, label)
-            if rows is None:
-                # 🛡️ #2 + #5 — in apps ka data BigQuery mein CHHUA NAHI jayega
-                record_failure(label, "fetch fail — in apps ka data CHHUA NAHI jayega")
-                continue
-            all_rows.extend(rows)
-            ok_tokens |= ok
+    if "event" in ENABLED_REPORTS:
+        log.info("=" * 88)
+        log.info("📊 discovered custom events")
+        run_event_daily(client, tokens, flat_start, end, filters, events, sample_start, sample_end)
 
-        all_ok = (len(ok_tokens) == len(tokens))
-        log.info("   Kul: %s rows, %d/%d apps kaamyab",
-                 f"{len(all_rows):,}", len(ok_tokens), len(tokens))
+    if "event_cohort" in ENABLED_REPORTS:
+        log.info("=" * 88)
+        log.info("📊 custom event cohort economics")
+        run_event_cohort(client, tokens, cohort_start, end, filters, events, event_periods, sample_start, sample_end)
 
-        if DRY_RUN:
-            log.info("   [DRY_RUN] BigQuery chhua nahi")
-            if all_rows:
-                log.info("   [DRY_RUN] sample: %s",
-                         json.dumps(all_rows[0], indent=2)[:1200])
-            continue
-
-        if not ok_tokens:
-            record_failure(table, "koi chunk kaamyab nahi — kuch nahi kiya")
-            continue
-
-        tbl_ref = ensure_table(client, table, schema, report["cluster"])
-        replace_window(client, tbl_ref, table, all_rows, schema,
-                       ok_tokens, start, end, all_ok)
-
-    # 🛡️ #6 — exit code sach bolta hai
-    log.info("")
     if FAILURES:
-        log.error("=" * 74)
-        log.error("🔴 %d MASLE — run FAIL samjha jayega:", len(FAILURES))
+        log.error("=" * 88)
+        log.error("🔴 Completed with %d failures", len(FAILURES))
         for f in FAILURES:
-            log.error("   • %s", f)
-        log.error("=" * 74)
-        log.error("Jin apps ka fetch fail hua, unka purana data CHHUA NAHI gaya.")
-        sys.exit(1)
+            log.error("  • %s", f)
+        raise SystemExit(1)
 
-    log.info("✅ Mukammal — %d report, koi masla nahi.", len(active))
+    log.info("✅ Complete. Run ID: %s", RUN_ID)
 
 
 if __name__ == "__main__":
