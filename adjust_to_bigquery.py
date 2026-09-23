@@ -980,13 +980,55 @@ def atomic_replace_window(client: bigquery.Client, table_name: str, rows: list[d
             params.extend(extra_query_params)
         where_extra = f"\n AND {extra_delete_sql}" if extra_delete_sql else ""
         col_sql = ", ".join(f"`{c}`" for c in cols)
+
+        # Backward-compatible insert: existing v1/v2 tables may have count metrics
+        # (for example installs/clicks/sessions) as INT64 while v3 staging keeps
+        # report metrics numeric/FLOAT64 for maximum Adjust API compatibility.
+        # BigQuery will not implicitly insert FLOAT64 into INT64.  Build the
+        # SELECT list from the *actual target schema* and explicitly cast only
+        # when the staging and target types differ.  This preserves historical
+        # tables without DROP/RECREATE or destructive schema migrations.
+        target_table = client.get_table(target)
+        target_types = {f.name: f.field_type.upper() for f in target_table.schema}
+        staging_types = {f.name: f.field_type.upper() for f in schema}
+
+        bq_cast_type = {
+            "INTEGER": "INT64", "INT64": "INT64",
+            "FLOAT": "FLOAT64", "FLOAT64": "FLOAT64",
+            "BOOLEAN": "BOOL", "BOOL": "BOOL",
+            "STRING": "STRING",
+            "DATE": "DATE", "DATETIME": "DATETIME",
+            "TIMESTAMP": "TIMESTAMP", "TIME": "TIME",
+            "NUMERIC": "NUMERIC", "BIGNUMERIC": "BIGNUMERIC",
+            "BYTES": "BYTES",
+        }
+
+        select_exprs = []
+        casted = []
+        for c in cols:
+            src_t = staging_types.get(c, "")
+            dst_t = target_types.get(c, src_t)
+            src_norm = bq_cast_type.get(src_t, src_t)
+            dst_norm = bq_cast_type.get(dst_t, dst_t)
+            if src_norm and dst_norm and src_norm != dst_norm:
+                select_exprs.append(f"CAST(`{c}` AS {dst_norm}) AS `{c}`")
+                casted.append(f"{c}:{src_norm}->{dst_norm}")
+            else:
+                select_exprs.append(f"`{c}`")
+
+        if casted:
+            log.info("  [%s] schema compatibility casts: %s", table_name, ", ".join(casted[:25]))
+            if len(casted) > 25:
+                log.info("  [%s] ... plus %d more casts", table_name, len(casted) - 25)
+
+        select_sql = ", ".join(select_exprs)
         sql = f"""
         BEGIN TRANSACTION;
         DELETE FROM `{target}`
          WHERE date BETWEEN @start AND @end
            AND app_token IN UNNEST(@ok){where_extra};
         INSERT INTO `{target}` ({col_sql})
-        SELECT {col_sql} FROM `{staging}`;
+        SELECT {select_sql} FROM `{staging}`;
         COMMIT TRANSACTION;
         """
         client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
