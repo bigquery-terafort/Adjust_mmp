@@ -228,6 +228,8 @@ jobs:
 
           # API batching / reliability
           CHUNK_SIZE: ${{ steps.profile.outputs.chunk }}
+          MAX_WORKERS:        "6"
+          MAX_HTTP_IN_FLIGHT: "6"
           METRIC_BATCH_SIZE: ${{ steps.profile.outputs.metric_batch }}
           MAX_RETRIES: '6'
           REQUEST_TIMEOUT: '300'
