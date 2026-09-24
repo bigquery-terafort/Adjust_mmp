@@ -9,6 +9,12 @@ on:
 
   workflow_dispatch:
     inputs:
+      speed:
+        description: 'Raftaar: max = sab se tez · fast = tez · balanced = mehfooz (429 par isko chunein)'
+        required: false
+        default: 'max'
+        type: choice
+        options: ['max', 'fast', 'balanced']
       allow_empty_wipe:
         description: 'API 0 rows de to bhi purana data hata dein? (khatarnak — normally 0)'
         required: false
@@ -34,7 +40,7 @@ on:
       reports:
         description: 'Comma-separated: app,campaign,country,spend,cohort,event,event_cohort'
         required: false
-        default: 'app,campaign,country,spend,cohort,event,event_cohort,creative'
+        default: 'app,campaign,country,spend,cohort,event,event_cohort'
       cohort_periods:
         description: 'all_days | all_periods | key | comma list'
         required: false
@@ -100,7 +106,7 @@ jobs:
           INPUT_COHORT_LOOKBACK: ${{ inputs.cohort_lookback_days || '150' }}
           INPUT_CHUNK: ${{ inputs.chunk_size || '25' }}
           INPUT_METRIC_BATCH: ${{ inputs.metric_batch_size || '35' }}
-          INPUT_REPORTS: ${{ inputs.reports || 'app,campaign,country,spend,cohort,event,event_cohort,creative' }}
+          INPUT_REPORTS: ${{ inputs.reports || 'app,campaign,country,spend,cohort,event,event_cohort' }}
           INPUT_COHORT_PERIODS: ${{ inputs.cohort_periods || 'all_days' }}
           INPUT_EVENT_PERIODS: ${{ inputs.event_cohort_periods || 'key' }}
           INPUT_INCLUDE_WM: ${{ inputs.include_weekly_monthly_cohorts || '0' }}
@@ -119,7 +125,7 @@ jobs:
           INCLUDE_WM="$INPUT_INCLUDE_WM"
 
           if [[ '${{ github.event_name }}' == 'schedule' ]]; then
-            REPORTS='app,campaign,country,spend,cohort,event,event_cohort,creative'
+            REPORTS='app,campaign,country,spend,cohort,event,event_cohort'
             if [[ '${{ github.event.schedule }}' == '47 3 * * 0' ]]; then
               PROFILE='weekly-deep'
               LOOKBACK='30'
@@ -141,8 +147,7 @@ jobs:
           eval "$(REPORTS="$REPORTS" python - <<'PY'
           import json, os
           CORE     = ['app', 'campaign', 'country', 'event']
-          # 🆕 v3.4: 'creative' — campaign se nikala hua bhaari hissa.
-          OPTIONAL = ['spend', 'cohort', 'event_cohort', 'creative']
+          OPTIONAL = ['spend', 'cohort', 'event_cohort']
           requested = {x.strip() for x in os.environ['REPORTS'].split(',') if x.strip()}
           core = [x for x in CORE if x in requested]
           opt  = [x for x in OPTIONAL if x in requested]
@@ -186,9 +191,9 @@ jobs:
     timeout-minutes: 300
     strategy:
       fail-fast: false
-      # Two report families at once. Each job can use 4 concurrent Adjust HTTP calls,
-      # so account-wide concurrency stays around 8 instead of exploding to 40+.
-      max-parallel: 2
+      # 🔑 v3.5: CHAARON core reports EK SAATH. Pehle 2 the — campaign ko apni
+      #    bari ka intezaar karna parta tha, jis se poori run lambi hoti thi.
+      max-parallel: 4
       matrix: ${{ fromJson(needs.prepare.outputs.matrix_core) }}
 
     steps:
@@ -233,10 +238,22 @@ jobs:
           BQ_DATASET: adjust_data
           BQ_LOCATION: US
 
-          # 🔧 v3.4: campaign + creative sab se bhaari. Loader v3.4 mein campaign
-          #    ke dimensions 23 → 19 kiye (creative + country nikale); window bhi
-          #    chhota rakhte hain — ehtiyatan.
-          LOOKBACK_DAYS: ${{ (matrix.report == 'campaign' || matrix.report == 'creative') && '14' || needs.prepare.outputs.lookback }}
+          # 🔑 POORA window — har report ke liye. Bhaari reports ka hal
+          #    streaming + chunking se nikala hai, window kaat kar nahi.
+          LOOKBACK_DAYS: ${{ needs.prepare.outputs.lookback }}
+
+          # 🔑 v3.5 STREAMING: rows memory mein jama karne ke bajaye har 50k par
+          #    staging table mein chale jate hain. Isi se campaign ka OOM gaya —
+          #    "The operation was canceled." ab nahi aayega.
+          STREAM_FLUSH_ROWS: '50000'
+
+          # 🔑 v3.5 DATE CHUNKING: campaign sab se bhaari (23 dims × 150 metrics).
+          #    7-din ke tukron mein har request chhoti rehti hai.
+          DATE_CHUNK_DAYS: ${{ matrix.report == 'campaign' && '7' || '0' }}
+
+          # 🔑 v3.5 COHORT PERIOD BATCH: 66 families × 121 periods = ~8,000
+          #    metrics ek request mein — negotiation girti thi. 10 ke batches.
+          COHORT_PERIOD_BATCH: '10'
           COHORT_LOOKBACK_DAYS: ${{ needs.prepare.outputs.cohort_lookback }}
           START_DATE: ${{ needs.prepare.outputs.start_date }}
           END_DATE: ${{ needs.prepare.outputs.end_date }}
@@ -244,11 +261,39 @@ jobs:
           CHUNK_SIZE: ${{ needs.prepare.outputs.chunk }}
           METRIC_BATCH_SIZE: ${{ needs.prepare.outputs.metric_batch }}
 
-          # Per-job concurrency. With max-parallel=2 above, global steady-state
-          # Adjust concurrency is bounded around 8 requests.
-          MAX_WORKERS: '4'
-          MAX_HTTP_IN_FLIGHT: '4'
-          MAX_RETRIES: '6'
+          # 🔑 v3.5 RAFTAAR — do cheezein tay karti hain:
+          #    (a) report ka WAZAN: campaign/cohort/spend/event_cohort bhaari
+          #        hain, unhe zyada workers se faida; app/country/event chhote.
+          #    (b) `speed` input: balanced / fast / max
+          #
+          #    Global HTTP concurrency (saarey 7 reports ek saath):
+          #       balanced → ~22   fast → ~44   max → ~66   (default: MAX)
+          #    Scheduled run par input khali hota hai → fallback bhi MAX hai.
+          #
+          #    ⚠️ Adjust par rate limit hai. 429 par loader khud backoff karta
+          #       hai (RETRYABLE_STATUS mein 429 hai), magar bohot 429 aayein to
+          #       ULTA SUST ho jata hai. 'fast' se shuru karein; log mein
+          #       "retrying in Ns" bohot dikhe to 'balanced' kar dein.
+          MAX_WORKERS: >-
+            ${{ (contains('campaign cohort spend event_cohort', matrix.report)
+                 && (inputs.speed == 'balanced' && '4' || inputs.speed == 'fast' && '8' || '12'))
+                || (inputs.speed == 'balanced' && '2' || inputs.speed == 'fast' && '4' || '6') }}
+
+          # HTTP gate = workers. Kam rakhne ka faida nahi — workers khali baithenge.
+          MAX_HTTP_IN_FLIGHT: >-
+            ${{ (contains('campaign cohort spend event_cohort', matrix.report)
+                 && (inputs.speed == 'balanced' && '4' || inputs.speed == 'fast' && '8' || '12'))
+                || (inputs.speed == 'balanced' && '2' || inputs.speed == 'fast' && '4' || '6') }}
+
+          # 🔑 CHUNK_SIZE: ek request mein kitne app tokens. Bara chunk = kam
+          #    requests = tez. Streaming ki wajah se memory ab masla nahi.
+          #    141 apps: 25 → 6 requests, 50 → 3 requests per window.
+          CHUNK_SIZE: ${{ inputs.speed == 'balanced' && '25' || '50' }}
+
+          # 🔧 v3.5: purana `MAX_HTTP_IN_FLIGHT: '4'` yahan se hataya — wo upar
+          #    wali speed-aware value ko override kar raha tha, jis se 12 workers
+          #    banane ke bawajood sirf 4 requests chal patin (workers khali baithe).
+          MAX_RETRIES: '8'
           REQUEST_TIMEOUT: '300'
 
           REPORTS: ${{ matrix.report }}
@@ -296,9 +341,8 @@ jobs:
     timeout-minutes: 300
     strategy:
       fail-fast: false
-      # Two report families at once. Each job can use 4 concurrent Adjust HTTP calls,
-      # so account-wide concurrency stays around 8 instead of exploding to 40+.
-      max-parallel: 2
+      # 🔑 v3.5: teeno optional reports ek saath.
+      max-parallel: 3
       matrix: ${{ fromJson(needs.prepare.outputs.matrix_optional) }}
 
     steps:
@@ -343,10 +387,22 @@ jobs:
           BQ_DATASET: adjust_data
           BQ_LOCATION: US
 
-          # 🔧 v3.4: campaign + creative sab se bhaari. Loader v3.4 mein campaign
-          #    ke dimensions 23 → 19 kiye (creative + country nikale); window bhi
-          #    chhota rakhte hain — ehtiyatan.
-          LOOKBACK_DAYS: ${{ (matrix.report == 'campaign' || matrix.report == 'creative') && '14' || needs.prepare.outputs.lookback }}
+          # 🔑 POORA window — har report ke liye. Bhaari reports ka hal
+          #    streaming + chunking se nikala hai, window kaat kar nahi.
+          LOOKBACK_DAYS: ${{ needs.prepare.outputs.lookback }}
+
+          # 🔑 v3.5 STREAMING: rows memory mein jama karne ke bajaye har 50k par
+          #    staging table mein chale jate hain. Isi se campaign ka OOM gaya —
+          #    "The operation was canceled." ab nahi aayega.
+          STREAM_FLUSH_ROWS: '50000'
+
+          # 🔑 v3.5 DATE CHUNKING: campaign sab se bhaari (23 dims × 150 metrics).
+          #    7-din ke tukron mein har request chhoti rehti hai.
+          DATE_CHUNK_DAYS: ${{ matrix.report == 'campaign' && '7' || '0' }}
+
+          # 🔑 v3.5 COHORT PERIOD BATCH: 66 families × 121 periods = ~8,000
+          #    metrics ek request mein — negotiation girti thi. 10 ke batches.
+          COHORT_PERIOD_BATCH: '10'
           COHORT_LOOKBACK_DAYS: ${{ needs.prepare.outputs.cohort_lookback }}
           START_DATE: ${{ needs.prepare.outputs.start_date }}
           END_DATE: ${{ needs.prepare.outputs.end_date }}
@@ -354,11 +410,39 @@ jobs:
           CHUNK_SIZE: ${{ needs.prepare.outputs.chunk }}
           METRIC_BATCH_SIZE: ${{ needs.prepare.outputs.metric_batch }}
 
-          # Per-job concurrency. With max-parallel=2 above, global steady-state
-          # Adjust concurrency is bounded around 8 requests.
-          MAX_WORKERS: '4'
-          MAX_HTTP_IN_FLIGHT: '4'
-          MAX_RETRIES: '6'
+          # 🔑 v3.5 RAFTAAR — do cheezein tay karti hain:
+          #    (a) report ka WAZAN: campaign/cohort/spend/event_cohort bhaari
+          #        hain, unhe zyada workers se faida; app/country/event chhote.
+          #    (b) `speed` input: balanced / fast / max
+          #
+          #    Global HTTP concurrency (saarey 7 reports ek saath):
+          #       balanced → ~22   fast → ~44   max → ~66   (default: MAX)
+          #    Scheduled run par input khali hota hai → fallback bhi MAX hai.
+          #
+          #    ⚠️ Adjust par rate limit hai. 429 par loader khud backoff karta
+          #       hai (RETRYABLE_STATUS mein 429 hai), magar bohot 429 aayein to
+          #       ULTA SUST ho jata hai. 'fast' se shuru karein; log mein
+          #       "retrying in Ns" bohot dikhe to 'balanced' kar dein.
+          MAX_WORKERS: >-
+            ${{ (contains('campaign cohort spend event_cohort', matrix.report)
+                 && (inputs.speed == 'balanced' && '4' || inputs.speed == 'fast' && '8' || '12'))
+                || (inputs.speed == 'balanced' && '2' || inputs.speed == 'fast' && '4' || '6') }}
+
+          # HTTP gate = workers. Kam rakhne ka faida nahi — workers khali baithenge.
+          MAX_HTTP_IN_FLIGHT: >-
+            ${{ (contains('campaign cohort spend event_cohort', matrix.report)
+                 && (inputs.speed == 'balanced' && '4' || inputs.speed == 'fast' && '8' || '12'))
+                || (inputs.speed == 'balanced' && '2' || inputs.speed == 'fast' && '4' || '6') }}
+
+          # 🔑 CHUNK_SIZE: ek request mein kitne app tokens. Bara chunk = kam
+          #    requests = tez. Streaming ki wajah se memory ab masla nahi.
+          #    141 apps: 25 → 6 requests, 50 → 3 requests per window.
+          CHUNK_SIZE: ${{ inputs.speed == 'balanced' && '25' || '50' }}
+
+          # 🔧 v3.5: purana `MAX_HTTP_IN_FLIGHT: '4'` yahan se hataya — wo upar
+          #    wali speed-aware value ko override kar raha tha, jis se 12 workers
+          #    banane ke bawajood sirf 4 requests chal patin (workers khali baithe).
+          MAX_RETRIES: '8'
           REQUEST_TIMEOUT: '300'
 
           REPORTS: ${{ matrix.report }}
