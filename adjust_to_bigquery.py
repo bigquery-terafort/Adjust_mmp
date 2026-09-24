@@ -138,6 +138,16 @@ MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "6"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "300"))
 UTC_OFFSET = os.environ.get("UTC_OFFSET", "+00:00").strip()
 REPORTING_CURRENCY = os.environ.get("REPORTING_CURRENCY", "USD").strip().upper()
+# ══ 🛡️ v3.3 (2026-09-24) — KHALI-JAWAB GUARD ══════════════════════════════
+#  Adjust kabhi kabhi 0 rows ka "kaamyab" jawab deta hai (dimension qubool nahi
+#  hui, ya API sust). Purana code us soorat mein window DELETE kar ke 0 rows
+#  likh deta tha — yani ek khali jawab poora data ura deta tha.
+#  Live saboot (2026-09-23): spend_reconciliation_daily aur
+#  event_cohort_daily_performance dono 0 rows par aa gayin.
+#  Ab: agar 0 rows aayein MAGAR us window mein pehle se data ho → FAIL, DELETE nahi.
+#  Jaan-boojh ke purge karna ho to ALLOW_EMPTY_WIPE=1.
+ALLOW_EMPTY_WIPE = os.environ.get("ALLOW_EMPTY_WIPE", "0").strip() == "1"
+
 AD_SPEND_MODE = os.environ.get("AD_SPEND_MODE", "network").strip().lower()
 SPEND_RECON_MODES = [x.strip().lower() for x in os.environ.get(
     "SPEND_RECON_MODES", "adjust,network,mixed").split(",") if x.strip()]
@@ -1021,12 +1031,42 @@ def atomic_replace_window(client: bigquery.Client, table_name: str, rows: list[d
                           *, cluster: list[str], extra_delete_sql: str = "", extra_query_params: list[Any] | None = None):
     """Load staging first, then DELETE+INSERT inside one BigQuery transaction.
 
-    Empty successful result intentionally deletes stale data for the successful apps/window.
+    Empty successful result intentionally deletes stale data for the successful apps/window,
+    MAGAR sirf tab jab us window mein pehle se kuch na ho (v3.3 khali-jawab guard).
     """
     if not ok_tokens:
         record_failure(table_name, "no successful app tokens")
         return
     target = ensure_table(client, table_name, schema, cluster)
+
+    # ── 🛡️ v3.3 KHALI-JAWAB GUARD ────────────────────────────────────────────
+    #  Sirf tab chalta hai jab: 0 rows aaye AUR schema mein `date` column ho.
+    #  Query partition-pruned COUNT hai (tables `date` par partitioned hain),
+    #  is liye sasti hai. Koi bhi gharbar ho to FAIL karte hain, wipe nahi.
+    if (not rows) and (not ALLOW_EMPTY_WIPE) and any(f.name == "date" for f in schema):
+        try:
+            existing = list(client.query(
+                f"SELECT COUNT(*) AS c FROM `{GCP_PROJECT}.{BQ_DATASET}.{table_name}` "
+                f"WHERE `date` BETWEEN @start AND @end",
+                job_config=bigquery.QueryJobConfig(query_parameters=[
+                    bigquery.ScalarQueryParameter("start", "DATE", start.isoformat()),
+                    bigquery.ScalarQueryParameter("end", "DATE", end.isoformat()),
+                ]),
+            ).result())[0].c
+        except Exception as exc:
+            record_failure(table_name,
+                           f"0 rows aaye aur maujooda data gin nahi sake ({exc}) — "
+                           f"ehtiyatan DELETE nahi kiya")
+            return
+        if existing > 0:
+            record_failure(
+                table_name,
+                f"Adjust ne 0 rows diye magar {start}..{end} mein pehle se {existing} rows hain — "
+                f"DELETE nahi kiya (khali-jawab guard). Jaan-boojh ke hatana ho to ALLOW_EMPTY_WIPE=1."
+            )
+            return
+        log.warning("⚠️  %s: 0 rows — magar window pehle se khali thi, aage barh rahe hain", table_name)
+
     cols = [safe_ident(f.name) for f in schema]
     run_suffix = re.sub(r"[^A-Za-z0-9_]", "_", RUN_ID)[-80:]
     staging_name = f"{table_name}__stg_{run_suffix}"
@@ -1577,7 +1617,9 @@ def run_event_cohort(client: bigquery.Client | None, tokens: list[str], start: d
 # Main
 # -----------------------------------------------------------------------------
 def main() -> None:
-    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT COMPLETE REPORTING WAREHOUSE")
+    # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI hai — workflow ka "Verify loader"
+    #    step isi ko grep karta hai. Badlo to workflow bhi badalna parega.
+    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT | loader v3.3 (khali-jawab guard)")
     log.info("Workers: %d | max Adjust HTTP in-flight: %d | persist_catalogs=%s", MAX_WORKERS, MAX_HTTP_IN_FLIGHT, PERSIST_CATALOGS)
     for name, value in (
         ("ADJUST_API_TOKEN", ADJUST_API_TOKEN),
@@ -1654,6 +1696,12 @@ def main() -> None:
         log.error("🔴 Completed with %d failures", len(FAILURES))
         for f in FAILURES:
             log.error("  • %s", f)
+        if any("khali-jawab guard" in f for f in FAILURES):
+            log.error("-" * 88)
+            log.error("💡 'khali-jawab guard' ka matlab: Adjust ne us report ke liye 0 rows diye,")
+            log.error("   is liye purana data URAYA NAHI gaya (yehi chahiye tha).")
+            log.error("   Asal wajah upar negotiation log mein dekhein —")
+            log.error("   aksar koi dimension/metric qubool nahi hoti, ya API sust hota hai.")
         raise SystemExit(1)
 
     log.info("✅ Complete. Run ID: %s", RUN_ID)
