@@ -9,6 +9,12 @@ on:
 
   workflow_dispatch:
     inputs:
+      allow_empty_wipe:
+        description: 'API 0 rows de to bhi purana data hata dein? (khatarnak — normally 0)'
+        required: false
+        default: '0'
+        type: choice
+        options: ['0', '1']
       lookback_days:
         description: 'Flat reports rolling window (days)'
         required: false
@@ -66,7 +72,14 @@ jobs:
     name: Build Adjust run profile
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.profile.outputs.matrix }}
+      # 🔧 v3.3: DO matrix. CORE reports ka fail hona workflow LAAL karta hai;
+      #    OPTIONAL (spend/cohort/event_cohort) abhi tajurbati hain — un ka fail
+      #    hona CORE ko nahi girata. (2026-09-23: teen run LAAL huin sirf optional
+      #    ki wajah se, jabke app/country/event kaamyab the.)
+      matrix_core: ${{ steps.profile.outputs.matrix_core }}
+      matrix_optional: ${{ steps.profile.outputs.matrix_optional }}
+      has_core: ${{ steps.profile.outputs.has_core }}
+      has_optional: ${{ steps.profile.outputs.has_optional }}
       lookback: ${{ steps.profile.outputs.lookback }}
       cohort_lookback: ${{ steps.profile.outputs.cohort_lookback }}
       chunk: ${{ steps.profile.outputs.chunk }}
@@ -124,18 +137,28 @@ jobs:
             fi
           fi
 
-          MATRIX=$(REPORTS="$REPORTS" python - <<'PY'
+          # 🔧 v3.3: CORE aur OPTIONAL alag alag matrix.
+          eval "$(REPORTS="$REPORTS" python - <<'PY'
           import json, os
-          allowed = ['app','campaign','country','spend','cohort','event','event_cohort']
+          CORE     = ['app', 'campaign', 'country', 'event']
+          OPTIONAL = ['spend', 'cohort', 'event_cohort']
           requested = {x.strip() for x in os.environ['REPORTS'].split(',') if x.strip()}
-          selected = [x for x in allowed if x in requested]
-          if not selected:
+          core = [x for x in CORE if x in requested]
+          opt  = [x for x in OPTIONAL if x in requested]
+          if not core and not opt:
               raise SystemExit('No valid reports selected')
-          print(json.dumps({'report': selected}, separators=(',', ':')))
+          # GitHub khali matrix par error deta hai — placeholder + has_* flag se skip.
+          print("MATRIX_CORE='%s'" % json.dumps({'report': core or ['app']}, separators=(',', ':')))
+          print("MATRIX_OPT='%s'"  % json.dumps({'report': opt  or ['spend']}, separators=(',', ':')))
+          print("HAS_CORE='%s'" % ('1' if core else '0'))
+          print("HAS_OPT='%s'"  % ('1' if opt  else '0'))
           PY
-          )
+          )"
 
-          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "matrix_core=$MATRIX_CORE"     >> "$GITHUB_OUTPUT"
+          echo "matrix_optional=$MATRIX_OPT"  >> "$GITHUB_OUTPUT"
+          echo "has_core=$HAS_CORE"           >> "$GITHUB_OUTPUT"
+          echo "has_optional=$HAS_OPT"        >> "$GITHUB_OUTPUT"
           echo "lookback=$LOOKBACK" >> "$GITHUB_OUTPUT"
           echo "cohort_lookback=$COHORT_LOOKBACK" >> "$GITHUB_OUTPUT"
           echo "chunk=$INPUT_CHUNK" >> "$GITHUB_OUTPUT"
@@ -149,12 +172,14 @@ jobs:
           echo "profile=$PROFILE" >> "$GITHUB_OUTPUT"
 
           echo "Profile: $PROFILE"
-          echo "Reports matrix: $MATRIX"
+          echo "CORE matrix    : $MATRIX_CORE (enabled=$HAS_CORE)"
+          echo "OPTIONAL matrix: $MATRIX_OPT (enabled=$HAS_OPT)"
           echo "Flat lookback: $LOOKBACK"
           echo "Cohort lookback: $COHORT_LOOKBACK"
 
-  sync:
+  sync_core:
     name: Adjust ${{ matrix.report }} → BigQuery
+    if: needs.prepare.outputs.has_core == '1'
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 300
@@ -163,7 +188,7 @@ jobs:
       # Two report families at once. Each job can use 4 concurrent Adjust HTTP calls,
       # so account-wide concurrency stays around 8 instead of exploding to 40+.
       max-parallel: 2
-      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix_core) }}
 
     steps:
       - name: Checkout
@@ -207,7 +232,10 @@ jobs:
           BQ_DATASET: adjust_data
           BQ_LOCATION: US
 
-          LOOKBACK_DAYS: ${{ needs.prepare.outputs.lookback }}
+          # 🔧 v3.3: campaign sab se bhaari report hai (13 dimensions × 141 apps).
+          #    45-din window par 300-min timeout mein poori nahi hoti —
+          #    2026-09-17 se atki hui thi. Us ke liye chhota window.
+          LOOKBACK_DAYS: ${{ matrix.report == 'campaign' && '14' || needs.prepare.outputs.lookback }}
           COHORT_LOOKBACK_DAYS: ${{ needs.prepare.outputs.cohort_lookback }}
           START_DATE: ${{ needs.prepare.outputs.start_date }}
           END_DATE: ${{ needs.prepare.outputs.end_date }}
@@ -237,6 +265,9 @@ jobs:
           UTC_OFFSET: '+00:00'
           DRY_RUN: ${{ needs.prepare.outputs.dry_run }}
 
+          # 🛡️ v3.3: 0 rows aane par purana data URAYA na jaye.
+          ALLOW_EMPTY_WIPE: ${{ inputs.allow_empty_wipe || '0' }}
+
           # Only one concurrent matrix job should rewrite the shared catalogs.
           PERSIST_CATALOGS: ${{ matrix.report == 'app' && '1' || '0' }}
 
@@ -253,18 +284,147 @@ jobs:
             echo "- Per-job HTTP cap: **4**"
           } >> "$GITHUB_STEP_SUMMARY"
 
+
+  sync_optional:
+    name: Adjust ${{ matrix.report }} → BigQuery (optional)
+    if: needs.prepare.outputs.has_optional == '1'
+    # 🛡️ v3.3: JOB-level — ye reports fail hon to workflow LAAL na ho.
+    continue-on-error: true
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      # Two report families at once. Each job can use 4 concurrent Adjust HTTP calls,
+      # so account-wide concurrency stays around 8 instead of exploding to 40+.
+      max-parallel: 2
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix_optional) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS_JSON }}
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify loader
+        run: |
+          set -euo pipefail
+          test -f adjust_to_bigquery.py
+          python -m py_compile adjust_to_bigquery.py
+          grep -q 'v3.2 PARALLEL-REPORT' adjust_to_bigquery.py || {
+            echo '::error::Repo is not running the v3.2 parallel-report loader'
+            exit 1
+          }
+
+      - name: Run ${{ matrix.report }} report
+        env:
+          ADJUST_API_TOKEN: ${{ secrets.ADJUST_API_TOKEN }}
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
+          ADJUST_APP_TOKENS: ${{ secrets.ADJUST_APP_TOKENS }}
+
+          APP_TOKENS_FILE: app_tokens.txt
+          BQ_DATASET: adjust_data
+          BQ_LOCATION: US
+
+          # 🔧 v3.3: campaign sab se bhaari report hai (13 dimensions × 141 apps).
+          #    45-din window par 300-min timeout mein poori nahi hoti —
+          #    2026-09-17 se atki hui thi. Us ke liye chhota window.
+          LOOKBACK_DAYS: ${{ matrix.report == 'campaign' && '14' || needs.prepare.outputs.lookback }}
+          COHORT_LOOKBACK_DAYS: ${{ needs.prepare.outputs.cohort_lookback }}
+          START_DATE: ${{ needs.prepare.outputs.start_date }}
+          END_DATE: ${{ needs.prepare.outputs.end_date }}
+
+          CHUNK_SIZE: ${{ needs.prepare.outputs.chunk }}
+          METRIC_BATCH_SIZE: ${{ needs.prepare.outputs.metric_batch }}
+
+          # Per-job concurrency. With max-parallel=2 above, global steady-state
+          # Adjust concurrency is bounded around 8 requests.
+          MAX_WORKERS: '4'
+          MAX_HTTP_IN_FLIGHT: '4'
+          MAX_RETRIES: '6'
+          REQUEST_TIMEOUT: '300'
+
+          REPORTS: ${{ matrix.report }}
+          COHORT_PERIODS: ${{ needs.prepare.outputs.cohort_periods }}
+          EVENT_COHORT_PERIODS: ${{ needs.prepare.outputs.event_periods }}
+          INCLUDE_WEEKLY_MONTHLY_COHORTS: ${{ needs.prepare.outputs.include_wm }}
+          COHORT_MATURITIES: 'immature,mature'
+
+          ATTRIBUTION_SOURCE: dynamic
+          ATTRIBUTION_TYPES: ''
+          AD_SPEND_MODE: network
+          SPEND_RECON_MODES: 'adjust,network,mixed'
+
+          REPORTING_CURRENCY: USD
+          UTC_OFFSET: '+00:00'
+          DRY_RUN: ${{ needs.prepare.outputs.dry_run }}
+
+          # 🛡️ v3.3: 0 rows aane par purana data URAYA na jaye.
+          ALLOW_EMPTY_WIPE: ${{ inputs.allow_empty_wipe || '0' }}
+
+          # Only one concurrent matrix job should rewrite the shared catalogs.
+          PERSIST_CATALOGS: ${{ matrix.report == 'app' && '1' || '0' }}
+
+        run: python adjust_to_bigquery.py
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Adjust report: ${{ matrix.report }}"
+            echo "- Profile: **${{ needs.prepare.outputs.profile }}**"
+            echo "- Result: **${{ job.status }}**"
+            echo "- Per-job workers: **4**"
+            echo "- Per-job HTTP cap: **4**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
   final:
     name: Adjust sync summary
-    needs: [prepare, sync]
+    needs: [prepare, sync_core, sync_optional]
     if: always()
     runs-on: ubuntu-latest
     steps:
+      # 🔑 v3.3: SIRF sync_core ka nateeja workflow ka nateeja hai.
+      #    Koi `gh api` nahi — job-level results kaafi hain (permissions bhi
+      #    nahi chahiyen; purani koshish `actions: read` na hone par 403 deti).
       - name: Final result
         run: |
-          echo "Profile: ${{ needs.prepare.outputs.profile }}"
-          echo "Matrix result: ${{ needs.sync.result }}"
-          if [[ '${{ needs.sync.result }}' != 'success' ]]; then
-            echo '::error::One or more Adjust report jobs failed/cancelled. Check the individual matrix job.'
+          set -uo pipefail
+          CORE='${{ needs.sync_core.result }}'
+          OPT='${{ needs.sync_optional.result }}'
+          {
+            echo "## Adjust sync — ${{ needs.prepare.outputs.profile }}"
+            echo "- CORE (app, campaign, country, event): **$CORE**"
+            echo "- OPTIONAL (spend, cohort, event_cohort): **$OPT**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "CORE=$CORE  OPTIONAL=$OPT"
+
+          if [[ "$CORE" == 'failure' || "$CORE" == 'cancelled' ]]; then
+            echo '::error::CORE Adjust reports fail huin — ye asli masla hai.'
             exit 1
           fi
-          echo '✅ All selected Adjust report families completed.'
+
+          if [[ "$OPT" == 'failure' || "$OPT" == 'cancelled' ]]; then
+            echo '::warning::Optional report (spend/cohort/event_cohort) fail hui. CORE theek hai, workflow GREEN. Us matrix job ka log dekhein.'
+            echo "- 🟡 Optional report fail hui — us job ka log dekhein" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo '✅ CORE Adjust reports mukammal.'
