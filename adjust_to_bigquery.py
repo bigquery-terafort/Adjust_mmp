@@ -148,6 +148,37 @@ REPORTING_CURRENCY = os.environ.get("REPORTING_CURRENCY", "USD").strip().upper()
 #  Jaan-boojh ke purge karna ho to ALLOW_EMPTY_WIPE=1.
 ALLOW_EMPTY_WIPE = os.environ.get("ALLOW_EMPTY_WIPE", "0").strip() == "1"
 
+# ══ 🔑 v3.5 (2026-09-24) — STREAMING WRITES (OOM ka asal hal) ══════════════
+#  MASLA: loader saarey rows `all_rows` list mein jama karta tha. campaign par
+#  23 dimensions × 150 metrics = 173 fields per row; 141 apps × 14 din ke rows
+#  GitHub runner ki 7 GB RAM kha jate the. Python process OOM-kill hota tha
+#  aur GitHub "The operation was canceled." likhta tha (error nahi — is liye
+#  wajah kabhi saaf nahi hui). campaign_daily_performance 2026-09-17 par atak
+#  gayi thi. Live saboot (run #81, 11:48 UTC):
+#      11:49:18  Metrics supported 150/183     ← negotiation theek
+#      11:52:18  schema +125 fields            ← rows aa rahe the
+#      11:53:26  The operation was canceled    ← OOM
+#
+#  HAL: rows ko memory mein jama karne ke bajaye seedha STAGING table mein
+#  bhejte raho (batch by batch), aur aakhir mein ek atomic swap. Memory kabhi
+#  ek batch se zyada nahi hoti. DATA POORA AATA HAI — kuch kaata nahi.
+STREAM_FLUSH_ROWS = max(1000, int(os.environ.get("STREAM_FLUSH_ROWS", "50000")))
+
+#  🔑 v3.6: buffer ki asal HAD — bytes mein. Row count report ke hisaab se
+#  bilkul alag matlab rakhta hai (campaign row = 173 fields, app row = ~20).
+#  GitHub runner ~16 GB deta hai; 400 MB buffer mehfooz hai aur BigQuery
+#  load job ke liye bhi theek size.
+STREAM_MAX_BYTES = max(50_000_000, int(os.environ.get("STREAM_MAX_BYTES", "400000000")))
+
+#  DATE CHUNKING: har app-chunk ka window bhi chhote tukron mein. 0 = band.
+DATE_CHUNK_DAYS = max(0, int(os.environ.get("DATE_CHUNK_DAYS", "0")))
+
+#  COHORT PERIOD BATCH: 66 metric families × 121 periods = ~8,000 metrics ek
+#  request mein — negotiation girti thi. 10-period batches mein 660 metrics.
+COHORT_PERIOD_BATCH = max(1, int(os.environ.get("COHORT_PERIOD_BATCH", "10")))
+
+ALLOW_EMPTY_WIPE = os.environ.get("ALLOW_EMPTY_WIPE", "0").strip() == "1"
+
 AD_SPEND_MODE = os.environ.get("AD_SPEND_MODE", "network").strip().lower()
 SPEND_RECON_MODES = [x.strip().lower() for x in os.environ.get(
     "SPEND_RECON_MODES", "adjust,network,mixed").split(",") if x.strip()]
@@ -179,7 +210,71 @@ RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 # Bounded concurrency. Multiple report/event worker pools may exist at once, but
 # this semaphore guarantees that the process never has more than
 # MAX_HTTP_IN_FLIGHT live Adjust HTTP requests.
-_HTTP_GATE = threading.BoundedSemaphore(MAX_HTTP_IN_FLIGHT)
+class _AdaptiveGate:
+    """🔑 v3.6: KHUD-MUTABIQ HTTP gate.
+
+    MASLA: sahi concurrency pehle se maloom nahi. Zyada rakho to Adjust 429
+    deta hai aur exponential backoff ki wajah se ULTA SUST ho jata hai; kam
+    rakho to waqt zaya. Aur sahi number din/waqt ke hisaab se badalta rehta hai.
+
+    HAL: gate khud seekhta hai.
+       • 429 / 503 aaye        → limit AADHI kar do (kam se kam 2), 60s cooldown
+       • 60s tak saaf chala    → limit +2 (MAX tak wapas)
+    Is se `max` (66) set karna mehfooz ho jata hai: agar Adjust na sambhale to
+    loader khud neeche aa jayega, aur haalat behtar hote hi wapas upar.
+    """
+
+    def __init__(self, limit: int):
+        self.max_limit = max(1, limit)
+        self.limit = self.max_limit
+        self._active = 0
+        self._cv = threading.Condition()
+        self._last_throttle = 0.0
+        self._last_grow = time.monotonic()
+
+    def __enter__(self):
+        with self._cv:
+            while self._active >= self.limit:
+                self._cv.wait(timeout=1.0)
+            self._active += 1
+        return self
+
+    def __exit__(self, *exc):
+        with self._cv:
+            self._active -= 1
+            self._cv.notify()
+        return False
+
+    def penalize(self):
+        """429/503 mila — concurrency aadhi."""
+        now = time.monotonic()
+        with self._cv:
+            if now - self._last_throttle < 5.0:
+                return                      # ek hi mauqe par baar baar na girayein
+            old = self.limit
+            self.limit = max(2, self.limit // 2)
+            self._last_throttle = now
+            self._last_grow = now
+            if self.limit != old:
+                log.warning("🐢 rate-limit: HTTP concurrency %d → %d (khud-mutabiq)", old, self.limit)
+            self._cv.notify_all()
+
+    def maybe_recover(self):
+        """60s saaf chala — thora upar."""
+        now = time.monotonic()
+        with self._cv:
+            if self.limit >= self.max_limit:
+                return
+            if now - self._last_throttle < 60.0 or now - self._last_grow < 60.0:
+                return
+            old = self.limit
+            self.limit = min(self.max_limit, self.limit + 2)
+            self._last_grow = now
+            log.info("🐇 saaf chal raha: HTTP concurrency %d → %d", old, self.limit)
+            self._cv.notify_all()
+
+
+_HTTP_GATE = _AdaptiveGate(MAX_HTTP_IN_FLIGHT)
 _THREAD_LOCAL = threading.local()
 _NEG_CACHE_LOCK = threading.Lock()
 _FAILURE_LOCK = threading.Lock()
@@ -219,38 +314,18 @@ REPORTS: dict[str, dict[str, Any]] = {
     },
     "campaign": {
         "table": "campaign_daily_performance",
-        # 🔧 v3.4 (2026-09-24): CREATIVE aur COUNTRY_CODE nikaal diye.
-        #    🔴 KYUN: 23 dimensions the — day × app × campaign × adgroup ×
-        #       CREATIVE × COUNTRY = karoron rows. Report 2026-09-17 se chal hi
-        #       nahi rahi thi (7 din atki), aur CORE mein hone ki wajah se poora
-        #       workflow LAAL kar rahi thi. Muqabla: `spend` ke 11 dimensions par
-        #       1.9M rows aaram se chal gaye.
-        #    Creative-level ab apne `creative` report mein hai (OPTIONAL),
-        #    country-level `country` report mein pehle se maujood hai.
         "dimensions": [
             "day", "app", "app_token", "os_name", "platform",
             "partner_name", "partner", "partner_id", "channel", "network",
             "ad_account_id",
             "campaign", "campaign_network", "campaign_id_network",
             "adgroup", "adgroup_network", "adgroup_id_network",
-            "source_network", "source_id_network",
-        ],
-        "cluster": ["app_token", "partner", "campaign_id_network"],
-        "desc": "MMP attribution / campaign / adgroup (creative alag report mein)",
-    },
-    "creative": {
-        # 🆕 v3.4: campaign se nikala hua creative-level hissa. OPTIONAL hai —
-        #    bhaari hai, fail ho to CORE ko nahi girata.
-        "table": "creative_daily_performance",
-        "dimensions": [
-            "day", "app", "app_token", "os_name",
-            "partner_name", "partner", "network",
-            "campaign_network", "campaign_id_network",
-            "adgroup_network", "adgroup_id_network",
             "creative", "creative_network", "creative_id_network",
+            "source_network", "source_id_network",
+            "country_code",
         ],
-        "cluster": ["app_token", "partner", "creative_id_network"],
-        "desc": "creative-level attribution (bhaari — OPTIONAL)",
+        "cluster": ["app_token", "partner", "campaign_id_network", "country_code"],
+        "desc": "MMP attribution / campaign / adgroup / creative",
     },
     "country": {
         "table": "country_daily_performance",
@@ -565,6 +640,8 @@ def http_get_json(url: str, params: dict[str, Any], label: str, quiet: bool = Fa
                 pass
 
             if r.status_code == 200:
+                # 🔑 v3.6: saaf chal raha hai to gate ko dheere dheere wapas upar.
+                _HTTP_GATE.maybe_recover()
                 return body, ""
 
             if isinstance(body, dict):
@@ -577,6 +654,9 @@ def http_get_json(url: str, params: dict[str, Any], label: str, quiet: bool = Fa
                 die(f"Adjust HTTP {r.status_code}: token/permission problem: {detail}")
 
             if r.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
+                # 🔑 v3.6: 429/503 = "bohot tez ja rahe ho" → gate khud neeche.
+                if r.status_code in (429, 503):
+                    _HTTP_GATE.penalize()
                 retry_after = r.headers.get("Retry-After")
                 wait = int(retry_after) if retry_after and retry_after.isdigit() else min(5 * (2 ** (attempt - 1)), 120)
                 wait += random.uniform(0.0, min(2.0, wait * 0.15))
@@ -845,7 +925,6 @@ def negotiate_metrics(dimensions: list[str], candidates: list[str], token: str,
     dropped = [m for m in unique_candidates if m not in found]
     log.info("Metrics supported %d/%d", len(supported), len(unique_candidates))
     if not supported and unique_candidates:
-        # 🔴 v3.4: yahi wajah hoti hai jab report bilkul khali aata hai.
         log.error("🔴 KOI METRIC QUBOOL NAHI HUI — dimensions=%s | ad_spend_mode=%s | cohort_maturity=%s",
                   dimensions, ad_spend_mode, cohort_maturity)
         log.error("   Pehli 10 candidates: %s", ", ".join(unique_candidates[:10]))
@@ -1054,22 +1133,111 @@ def safe_ident(name: str) -> str:
     return name
 
 
+class StagingWriter:
+    """🔑 v3.5: rows ko memory mein jama karne ke bajaye staging table mein
+    batch-by-batch bhejta hai. Memory hamesha ek batch jitni.
+
+    add(rows)  — buffer mein daalo; buffer bhar jaye to flush
+    flush()    — buffer BigQuery staging mein (WRITE_APPEND)
+    total      — kitne rows ja chuke
+    """
+
+    def __init__(self, client: bigquery.Client, table_name: str,
+                 schema: list[bigquery.SchemaField]):
+        self.client = client
+        self.schema = schema
+        run_suffix = re.sub(r"[^A-Za-z0-9_]", "_", RUN_ID)[-80:]
+        self.name = f"{table_name}__stg_{run_suffix}"
+        self.ref = f"{GCP_PROJECT}.{BQ_DATASET}.{self.name}"
+        self._buf: list[dict[str, Any]] = []
+        self.total = 0
+        self._created = False
+        self._row_bytes: int | None = None
+        self._flush_at = STREAM_FLUSH_ROWS
+
+    def _create(self):
+        if self._created:
+            return
+        try:
+            self.client.create_table(bigquery.Table(self.ref, schema=self.schema), exists_ok=True)
+        except Exception:
+            pass
+        self._created = True
+
+    def add(self, rows: list[dict[str, Any]]):
+        """🔑 v3.6: row-count AUR bytes — dono par flush.
+
+        Sirf row count par bharosa khatarnak hai: campaign ke ek row mein 173
+        fields hain, `app` ke row mein ~20. 50,000 rows ka matlab campaign par
+        ~700 MB aur app par ~60 MB — bilkul alag. Ab pehla batch naap kar asal
+        row size maloom karte hain aur usi hisaab se flush karte hain.
+        """
+        if not rows:
+            return
+        self._buf.extend(rows)
+
+        if self._row_bytes is None and len(self._buf) >= 200:
+            # ek baar naap lo — 200 rows ka namoona
+            try:
+                sample = json.dumps(self._buf[:200], default=str)
+                self._row_bytes = max(200, len(sample) // 200)
+                cap = max(2000, STREAM_MAX_BYTES // self._row_bytes)
+                self._flush_at = min(STREAM_FLUSH_ROWS, cap)
+                log.info("   → streaming: ~%d bytes/row, flush har %d rows",
+                         self._row_bytes, self._flush_at)
+            except Exception:
+                self._row_bytes = 0
+                self._flush_at = STREAM_FLUSH_ROWS
+
+        if len(self._buf) >= self._flush_at:
+            self.flush()
+
+    def flush(self):
+        if not self._buf:
+            return
+        self._create()
+        batch, self._buf = self._buf, []      # buffer foran khali — memory free
+        job = self.client.load_table_from_json(
+            batch, self.ref,
+            job_config=bigquery.LoadJobConfig(
+                schema=self.schema,
+                write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+                source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+            ),
+        )
+        job.result()
+        if job.output_rows != len(batch):
+            raise RuntimeError(f"staging row mismatch expected={len(batch)} loaded={job.output_rows}")
+        self.total += len(batch)
+        log.info("   → staging: +%d rows (kul %d)", len(batch), self.total)
+
+    def drop(self):
+        if self._created:
+            try:
+                self.client.delete_table(self.ref, not_found_ok=True)
+            except Exception:
+                pass
+
+
 def atomic_replace_window(client: bigquery.Client, table_name: str, rows: list[dict[str, Any]],
                           schema: list[bigquery.SchemaField], ok_tokens: set[str], start: date, end: date,
-                          *, cluster: list[str], extra_delete_sql: str = "", extra_query_params: list[Any] | None = None):
+                          *, cluster: list[str], extra_delete_sql: str = "", extra_query_params: list[Any] | None = None,
+                          writer: "StagingWriter | None" = None):
     """Load staging first, then DELETE+INSERT inside one BigQuery transaction.
 
     Empty successful result intentionally deletes stale data for the successful apps/window,
     MAGAR sirf tab jab us window mein pehle se kuch na ho (v3.3 khali-jawab guard).
     """
     if not ok_tokens:
-        # 🔧 v3.4: pehle yahan se seedha return tha — table BANTI HI NAHI thi.
+        # 🔧 v3.5: pehle yahan se seedha return tha — table BANTI HI NAHI thi.
         #    (cohort_daily_performance isi wajah se kabhi nahi bani.)
         try:
             ensure_table(client, table_name, schema, cluster)
             log.warning("⚠️  %s: khali table bana di (koi kaamyab app token nahi)", table_name)
         except Exception as exc:
             log.warning("⚠️  %s: khali table bhi nahi ban saki: %s", table_name, exc)
+        if writer is not None:
+            writer.drop()
         record_failure(table_name,
                        "koi kaamyab app token nahi — har chunk fail hua YA koi metric "
                        "qubool nahi hui. Upar 'Metrics supported 0/N' dekhein.")
@@ -1080,7 +1248,10 @@ def atomic_replace_window(client: bigquery.Client, table_name: str, rows: list[d
     #  Sirf tab chalta hai jab: 0 rows aaye AUR schema mein `date` column ho.
     #  Query partition-pruned COUNT hai (tables `date` par partitioned hain),
     #  is liye sasti hai. Koi bhi gharbar ho to FAIL karte hain, wipe nahi.
-    if (not rows) and (not ALLOW_EMPTY_WIPE) and any(f.name == "date" for f in schema):
+    # 🔑 v3.5: streaming mode mein rows staging mein ja chuke — ginti writer se.
+    row_count = writer.total if writer is not None else len(rows)
+
+    if (row_count == 0) and (not ALLOW_EMPTY_WIPE) and any(f.name == "date" for f in schema):
         try:
             existing = list(client.query(
                 f"SELECT COUNT(*) AS c FROM `{GCP_PROJECT}.{BQ_DATASET}.{table_name}` "
@@ -1105,14 +1276,22 @@ def atomic_replace_window(client: bigquery.Client, table_name: str, rows: list[d
         log.warning("⚠️  %s: 0 rows — magar window pehle se khali thi, aage barh rahe hain", table_name)
 
     cols = [safe_ident(f.name) for f in schema]
-    run_suffix = re.sub(r"[^A-Za-z0-9_]", "_", RUN_ID)[-80:]
-    staging_name = f"{table_name}__stg_{run_suffix}"
-    staging = f"{GCP_PROJECT}.{BQ_DATASET}.{staging_name}"
+    if writer is not None:
+        # 🔑 v3.5: streaming — staging pehle se bhari hui hai, sirf aakhri flush.
+        writer.flush()
+        staging_name, staging = writer.name, writer.ref
+    else:
+        run_suffix = re.sub(r"[^A-Za-z0-9_]", "_", RUN_ID)[-80:]
+        staging_name = f"{table_name}__stg_{run_suffix}"
+        staging = f"{GCP_PROJECT}.{BQ_DATASET}.{staging_name}"
 
     try:
-        st = bigquery.Table(staging, schema=schema)
-        client.create_table(st, exists_ok=False)
-        if rows:
+        if writer is None:
+            st = bigquery.Table(staging, schema=schema)
+            client.create_table(st, exists_ok=False)
+        else:
+            client.create_table(bigquery.Table(staging, schema=schema), exists_ok=True)
+        if writer is None and rows:
             job = client.load_table_from_json(
                 rows, staging,
                 job_config=bigquery.LoadJobConfig(
@@ -1186,7 +1365,30 @@ def atomic_replace_window(client: bigquery.Client, table_name: str, rows: list[d
         COMMIT TRANSACTION;
         """
         client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
-        log.info("✅ %s: replaced %s..%s for %d apps with %d rows", table_name, start, end, len(ok_tokens), len(rows))
+
+        # 🛡️ v3.6 POST-SWAP VERIFY: transaction ke baad BigQuery se ginti wapas
+        #    parho. Agar target mein utne rows nahi jitne staging mein the, to
+        #    kuch gir gaya — chup-chaap qubool mat karo.
+        try:
+            landed = list(client.query(
+                f"SELECT COUNT(*) AS c FROM `{target}` "
+                f"WHERE date BETWEEN @start AND @end AND app_token IN UNNEST(@ok)" + where_extra,
+                job_config=bigquery.QueryJobConfig(query_parameters=params),
+            ).result())[0].c
+            if landed != row_count:
+                record_failure(
+                    f"post_verify[{table_name}]",
+                    f"swap ke baad ginti nahi mili: bheje {row_count}, mile {landed} "
+                    f"({start}..{end}, {len(ok_tokens)} apps)")
+            else:
+                log.info("   🛡️ post-verify: %d rows target mein confirm", landed)
+        except Exception as exc:
+            log.warning("post-verify nahi chal saka (%s) — swap khud kaamyab tha", exc)
+        # 🔧 v3.6 BUG FIX: streaming mode mein `rows` khali list hoti hai
+        #    (data staging mein gaya tha), is liye `len(rows)` hamesha 0 likhta
+        #    tha — log jhoot bolta tha "with 0 rows" jabke lakhon rows gaye.
+        log.info("✅ %s: replaced %s..%s for %d apps with %d rows",
+                 table_name, start, end, len(ok_tokens), row_count)
     except Exception as exc:
         record_failure(f"atomic_replace[{table_name}]", exc)
     finally:
@@ -1267,29 +1469,89 @@ def persist_catalogs(client: bigquery.Client, filters: dict[str, list[dict[str, 
 def fetch_app_chunks_parallel(tokens: list[str], start: date, end: date, dimensions: list[str],
                               metrics: list[str], label_prefix: str, *, ad_spend_mode: str,
                               cohort_maturity: str | None = None):
-    """Fetch app-token chunks concurrently. Returns [(chunk_index, chunk, rows)]."""
+    """YIELDS (chunk_index, chunk, rows) — pehle poori list return karta tha.
+
+    🔑 v3.5: generator ban gaya. Pehle saarey chunks ka data ek saath memory
+    mein hota tha (OOM ki bari wajah). Ab caller har chunk ko aate hi staging
+    mein bhej deta hai.
+
+    🔑 DATE_CHUNK_DAYS > 0 ho to har app-chunk ka window bhi chhote tukron
+    mein toota jata hai, aur har tukra ALAG yield hota hai (merge nahi).
+    """
     chunks = list(chunked(tokens, CHUNK_SIZE))
     if not chunks:
-        return []
+        return
 
-    def do_one(ci: int, app_chunk: list[str]):
-        rows = fetch_merged(
-            app_chunk, start, end, dimensions, metrics,
-            f"{label_prefix}:chunk{ci}",
-            ad_spend_mode=ad_spend_mode, cohort_maturity=cohort_maturity,
-        )
-        return ci, app_chunk, rows
+    def date_windows(a: date, b: date):
+        if DATE_CHUNK_DAYS <= 0:
+            return [(a, b)]
+        out, cur = [], a
+        while cur <= b:
+            nxt = min(cur + timedelta(days=DATE_CHUNK_DAYS - 1), b)
+            out.append((cur, nxt))
+            cur = nxt + timedelta(days=1)
+        return out
 
-    results = []
-    with ThreadPoolExecutor(max_workers=worker_count(len(chunks)), thread_name_prefix="adjust-chunk") as pool:
-        futures = [pool.submit(do_one, ci, app_chunk) for ci, app_chunk in enumerate(chunks, 1)]
+    windows = date_windows(start, end)
+    if len(windows) > 1:
+        log.info("%s: window %s..%s → %d date-chunks (%d din each)",
+                 label_prefix, start, end, len(windows), DATE_CHUNK_DAYS)
+
+    def do_one(ci: int, app_chunk: list[str], wi: int, ws: date, we: date):
+        """🔑 v3.6: KHUD-MUTABIQ SPLIT.
+
+        CHUNK_SIZE / window kitna bara ho — pehle se maloom nahi. Bara chunk
+        tez hai (kam requests) magar Adjust par timeout kar sakta hai. Pehle
+        aisi soorat mein poora chunk fail ho jata tha.
+        Ab: fail hone par chunk ko AADHA kar ke dobara koshish karte hain,
+        aur agar phir bhi na chale to window ko aadha. 3 darje tak.
+        Is se bara CHUNK_SIZE (50) mehfooz ho jata hai — na chale to khud tootega.
+        """
+        lbl = f"{label_prefix}:chunk{ci}" if len(windows) == 1 else f"{label_prefix}:chunk{ci}:w{wi}"
+
+        def attempt(apps: list[str], a: date, b: date, depth: int, tag: str):
+            rows = fetch_merged(
+                apps, a, b, dimensions, metrics, tag,
+                ad_spend_mode=ad_spend_mode, cohort_maturity=cohort_maturity,
+            )
+            if rows is not None or depth >= 3:
+                return rows
+            # ── pehle apps aadhe ──
+            if len(apps) > 1:
+                mid = len(apps) // 2
+                log.warning("✂️  %s fail — apps aadhe (%d → %d+%d), dobara",
+                            tag, len(apps), mid, len(apps) - mid)
+                left = attempt(apps[:mid], a, b, depth + 1, f"{tag}.a")
+                right = attempt(apps[mid:], a, b, depth + 1, f"{tag}.b")
+                if left is None or right is None:
+                    return None
+                return left + right
+            # ── ek hi app bacha: window aadhi ──
+            span = (b - a).days
+            if span >= 1:
+                mid_d = a + timedelta(days=span // 2)
+                log.warning("✂️  %s fail — window aadhi (%s..%s), dobara", tag, a, b)
+                left = attempt(apps, a, mid_d, depth + 1, f"{tag}.w1")
+                right = attempt(apps, mid_d + timedelta(days=1), b, depth + 1, f"{tag}.w2")
+                if left is None or right is None:
+                    return None
+                return left + right
+            return None
+
+        return ci, app_chunk, attempt(app_chunk, ws, we, 0, lbl)
+
+    tasks = [(ci, ac, wi, ws, we)
+             for ci, ac in enumerate(chunks, 1)
+             for wi, (ws, we) in enumerate(windows, 1)]
+
+    with ThreadPoolExecutor(max_workers=worker_count(len(tasks)), thread_name_prefix="adjust-chunk") as pool:
+        futures = [pool.submit(do_one, *t) for t in tasks]
         for fut in as_completed(futures):
             try:
-                results.append(fut.result())
+                yield fut.result()
             except Exception as exc:
                 log.exception("%s worker crashed: %s", label_prefix, exc)
-                results.append((-1, [], None))
-    return sorted(results, key=lambda x: x[0])
+                yield (-1, [], None)
 
 # -----------------------------------------------------------------------------
 # Base reports
@@ -1302,14 +1564,37 @@ def run_flat_report(client: bigquery.Client | None, report_key: str, tokens: lis
     candidates = SPEND_METRICS if report_key == "spend" else BASE_METRICS
     modes = SPEND_RECON_MODES if report_key == "spend" else [AD_SPEND_MODE]
 
-    all_rows: list[dict[str, Any]] = []
     ok_tokens: set[str] = set()
-    union_metrics: list[str] = []
 
+    # ── 🔑 v3.5 PASS 1: sirf negotiation, koi fetch nahi ──
+    #    Schema pehle chahiye taake staging bana kar streaming shuru ho sake.
+    mode_metrics: dict[str, list[str]] = {}
+    union_metrics: list[str] = []
     for mode in modes:
         supported = negotiate_metrics(dims, candidates, tokens[0], sample_start, sample_end,
                                       ad_spend_mode=mode, cohort_maturity=None)
+        mode_metrics[mode] = supported
         union_metrics.extend(supported)
+
+    union_metrics = list(dict.fromkeys(union_metrics))
+    schema = schema_for_flat(dims, union_metrics, extra_fields=[
+        bigquery.SchemaField("ad_spend_mode", "STRING", mode="REQUIRED")
+    ])
+
+    # ── 🔑 v3.5 PASS 2: fetch + SEEDHA STAGING mein ──
+    #    Pehle saarey rows `all_rows` mein jama hote the. campaign par
+    #    (23 dims × 150 metrics = 173 fields/row) runner ki 7 GB RAM khatam ho
+    #    jati thi, Python OOM-kill hota tha, aur GitHub "The operation was
+    #    canceled." likhta tha. Ab memory ek batch (50k rows) jitni hoti hai.
+    writer = StagingWriter(client, cfg["table"], schema) if (client is not None and not DRY_RUN) else None
+    all_rows: list[dict[str, Any]] = []      # sirf DRY_RUN ke liye
+
+    for mode in modes:
+        supported = mode_metrics[mode]
+        if not supported:
+            record_failure(f"{report_key}:{mode}",
+                           "koi metric qubool nahi hui (upar 'KOI METRIC QUBOOL NAHI HUI' dekhein)")
+            continue
         for ci, app_chunk, raw in fetch_app_chunks_parallel(
                 tokens, start, end, dims, supported, f"{report_key}:{mode}",
                 ad_spend_mode=mode):
@@ -1317,13 +1602,12 @@ def run_flat_report(client: bigquery.Client | None, report_key: str, tokens: lis
                 record_failure(f"{report_key}:{mode}:chunk{ci}", "fetch failed")
                 continue
             parsed = parse_flat_rows(raw, dims, supported, extras={"ad_spend_mode": mode})
-            all_rows.extend(parsed)
+            if writer is not None:
+                writer.add(parsed)
+            else:
+                all_rows.extend(parsed)
             ok_tokens.update(app_chunk)
-
-    union_metrics = list(dict.fromkeys(union_metrics))
-    schema = schema_for_flat(dims, union_metrics, extra_fields=[
-        bigquery.SchemaField("ad_spend_mode", "STRING", mode="REQUIRED")
-    ])
+            del parsed, raw                  # memory foran free
     # Rows fetched under modes with fewer metrics simply leave missing nullable fields.
     if DRY_RUN:
         log.info("[DRY] %s rows=%d metrics=%d sample=%s", cfg["table"], len(all_rows), len(union_metrics), json.dumps(all_rows[:1], default=str)[:800])
@@ -1332,10 +1616,10 @@ def run_flat_report(client: bigquery.Client | None, report_key: str, tokens: lis
     if report_key == "spend":
         # Replace all configured modes in one transaction, so no extra filter needed.
         atomic_replace_window(client, cfg["table"], all_rows, schema, ok_tokens, start, end,
-                              cluster=cfg["cluster"] + ["ad_spend_mode"])
+                              cluster=cfg["cluster"] + ["ad_spend_mode"], writer=writer)
     else:
         atomic_replace_window(client, cfg["table"], all_rows, schema, ok_tokens, start, end,
-                              cluster=cfg["cluster"] + ["ad_spend_mode"],
+                              cluster=cfg["cluster"] + ["ad_spend_mode"], writer=writer,
                               extra_delete_sql="ad_spend_mode = @mode",
                               extra_query_params=[bigquery.ScalarQueryParameter("mode", "STRING", AD_SPEND_MODE)])
 
@@ -1391,37 +1675,66 @@ def run_cohort_report(client: bigquery.Client | None, tokens: list[str], start: 
                       filters: dict[str, list[dict[str, Any]]], periods: list[str], sample_start: date, sample_end: date):
     dims = choose_dimensions(COHORT_DIMENSIONS, filters)
     dims = negotiate_dimensions(dims, tokens[0], sample_start, sample_end)
-    metric_map = build_cohort_metric_map(periods)
-    candidates = list(metric_map.keys())
     fields = list(COHORT_FAMILIES.keys())
     schema = cohort_schema(dims, fields)
-    all_rows: list[dict[str, Any]] = []
     ok_tokens: set[str] = set()
 
+    # 🔑 v3.5 PERIOD BATCHING: 66 metric families × 121 periods = ~8,000 metrics
+    #    ek hi request mein — Adjust ki negotiation itna bara payload qubool
+    #    nahi karti thi ("Metrics supported 0/N"), ok_tokens khali reh jate the,
+    #    aur cohort_daily_performance table KABHI BANI HI NAHI.
+    #    Ab 10-period batches: 660 metrics per request. Rows staging mein jate
+    #    rehte hain, memory nahi bharti. DATA POORA — kuch kaata nahi.
+    period_batches = [periods[i:i + COHORT_PERIOD_BATCH]
+                      for i in range(0, len(periods), COHORT_PERIOD_BATCH)]
+    log.info("Cohort: %d periods → %d batches (×%d) × %d maturities",
+             len(periods), len(period_batches), COHORT_PERIOD_BATCH, len(COHORT_MATURITIES))
+
+    writer = StagingWriter(client, "cohort_daily_performance", schema) if (client is not None and not DRY_RUN) else None
+    all_rows: list[dict[str, Any]] = []      # sirf DRY_RUN ke liye
+    any_supported = False
+
     for maturity in COHORT_MATURITIES:
-        supported = negotiate_metrics(dims, candidates, tokens[0], sample_start, sample_end,
-                                      ad_spend_mode=AD_SPEND_MODE, cohort_maturity=maturity)
-        if not supported:
-            # 🔧 v3.4: pehle sirf warning thi — dono maturity fail hone par report
-            #    chup-chaap khali chali jati thi aur table hi nahi banti thi.
-            record_failure(f"cohort:{maturity}",
-                           "koi cohort metric qubool nahi hui (upar 'KOI METRIC QUBOOL NAHI HUI' dekhein)")
-            continue
-        for ci, app_chunk, raw in fetch_app_chunks_parallel(
-                tokens, start, end, dims, supported, f"cohort:{maturity}",
-                ad_spend_mode=AD_SPEND_MODE, cohort_maturity=maturity):
-            if raw is None:
-                record_failure(f"cohort:{maturity}:chunk{ci}", "fetch failed")
+        for bi, pbatch in enumerate(period_batches, 1):
+            metric_map = build_cohort_metric_map(pbatch)
+            candidates = list(metric_map.keys())
+            supported = negotiate_metrics(dims, candidates, tokens[0], sample_start, sample_end,
+                                          ad_spend_mode=AD_SPEND_MODE, cohort_maturity=maturity)
+            if not supported:
+                log.warning("cohort[%s] batch %d/%d (%s): koi metric qubool nahi hui — skip",
+                            maturity, bi, len(period_batches), ",".join(pbatch))
                 continue
-            all_rows.extend(normalize_cohort_rows(raw, dims, supported, metric_map, maturity))
-            ok_tokens.update(app_chunk)
+            any_supported = True
+            log.info("cohort[%s] batch %d/%d — periods=%s · metrics=%d/%d",
+                     maturity, bi, len(period_batches), ",".join(pbatch),
+                     len(supported), len(candidates))
+            for ci, app_chunk, raw in fetch_app_chunks_parallel(
+                    tokens, start, end, dims, supported, f"cohort:{maturity}:b{bi}",
+                    ad_spend_mode=AD_SPEND_MODE, cohort_maturity=maturity):
+                if raw is None:
+                    record_failure(f"cohort:{maturity}:b{bi}:chunk{ci}", "fetch failed")
+                    continue
+                parsed = normalize_cohort_rows(raw, dims, supported, metric_map, maturity)
+                if writer is not None:
+                    writer.add(parsed)
+                else:
+                    all_rows.extend(parsed)
+                ok_tokens.update(app_chunk)
+                del parsed, raw
+
+    if not any_supported:
+        record_failure("cohort",
+                       f"kisi bhi period-batch par koi metric qubool nahi hui "
+                       f"({len(period_batches)} batches × {len(COHORT_MATURITIES)} maturities). "
+                       f"Upar 'KOI METRIC QUBOOL NAHI HUI' wali line dekhein.")
 
     if DRY_RUN:
         log.info("[DRY] cohort rows=%d periods=%d sample=%s", len(all_rows), len(periods), json.dumps(all_rows[:1], default=str)[:900])
         return
     assert client is not None
     atomic_replace_window(client, "cohort_daily_performance", all_rows, schema, ok_tokens, start, end,
-                          cluster=["app_token", "partner", "campaign_id_network", "cohort_period"])
+                          cluster=["app_token", "partner", "campaign_id_network", "cohort_period"],
+                          writer=writer)
 
 # -----------------------------------------------------------------------------
 # Event reports
@@ -1659,7 +1972,9 @@ def run_event_cohort(client: bigquery.Client | None, tokens: list[str], start: d
 def main() -> None:
     # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI hai — workflow ka "Verify loader"
     #    step isi ko grep karta hai. Badlo to workflow bhi badalna parega.
-    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT | loader v3.3 (khali-jawab guard)")
+    # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI — workflow ka "Verify loader" grep.
+    # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI — workflow ka "Verify loader" grep.
+    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT | loader v3.6 (streaming + adaptive)")
     log.info("Workers: %d | max Adjust HTTP in-flight: %d | persist_catalogs=%s", MAX_WORKERS, MAX_HTTP_IN_FLIGHT, PERSIST_CATALOGS)
     for name, value in (
         ("ADJUST_API_TOKEN", ADJUST_API_TOKEN),
