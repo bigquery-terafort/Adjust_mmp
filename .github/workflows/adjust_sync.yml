@@ -34,7 +34,7 @@ on:
       reports:
         description: 'Comma-separated: app,campaign,country,spend,cohort,event,event_cohort'
         required: false
-        default: 'app,campaign,country,spend,cohort,event,event_cohort'
+        default: 'app,campaign,country,spend,cohort,event,event_cohort,creative'
       cohort_periods:
         description: 'all_days | all_periods | key | comma list'
         required: false
@@ -100,7 +100,7 @@ jobs:
           INPUT_COHORT_LOOKBACK: ${{ inputs.cohort_lookback_days || '150' }}
           INPUT_CHUNK: ${{ inputs.chunk_size || '25' }}
           INPUT_METRIC_BATCH: ${{ inputs.metric_batch_size || '35' }}
-          INPUT_REPORTS: ${{ inputs.reports || 'app,campaign,country,spend,cohort,event,event_cohort' }}
+          INPUT_REPORTS: ${{ inputs.reports || 'app,campaign,country,spend,cohort,event,event_cohort,creative' }}
           INPUT_COHORT_PERIODS: ${{ inputs.cohort_periods || 'all_days' }}
           INPUT_EVENT_PERIODS: ${{ inputs.event_cohort_periods || 'key' }}
           INPUT_INCLUDE_WM: ${{ inputs.include_weekly_monthly_cohorts || '0' }}
@@ -119,7 +119,7 @@ jobs:
           INCLUDE_WM="$INPUT_INCLUDE_WM"
 
           if [[ '${{ github.event_name }}' == 'schedule' ]]; then
-            REPORTS='app,campaign,country,spend,cohort,event,event_cohort'
+            REPORTS='app,campaign,country,spend,cohort,event,event_cohort,creative'
             if [[ '${{ github.event.schedule }}' == '47 3 * * 0' ]]; then
               PROFILE='weekly-deep'
               LOOKBACK='30'
@@ -141,7 +141,8 @@ jobs:
           eval "$(REPORTS="$REPORTS" python - <<'PY'
           import json, os
           CORE     = ['app', 'campaign', 'country', 'event']
-          OPTIONAL = ['spend', 'cohort', 'event_cohort']
+          # 🆕 v3.4: 'creative' — campaign se nikala hua bhaari hissa.
+          OPTIONAL = ['spend', 'cohort', 'event_cohort', 'creative']
           requested = {x.strip() for x in os.environ['REPORTS'].split(',') if x.strip()}
           core = [x for x in CORE if x in requested]
           opt  = [x for x in OPTIONAL if x in requested]
@@ -232,10 +233,10 @@ jobs:
           BQ_DATASET: adjust_data
           BQ_LOCATION: US
 
-          # 🔧 v3.3: campaign sab se bhaari report hai (13 dimensions × 141 apps).
-          #    45-din window par 300-min timeout mein poori nahi hoti —
-          #    2026-09-17 se atki hui thi. Us ke liye chhota window.
-          LOOKBACK_DAYS: ${{ matrix.report == 'campaign' && '14' || needs.prepare.outputs.lookback }}
+          # 🔧 v3.4: campaign + creative sab se bhaari. Loader v3.4 mein campaign
+          #    ke dimensions 23 → 19 kiye (creative + country nikale); window bhi
+          #    chhota rakhte hain — ehtiyatan.
+          LOOKBACK_DAYS: ${{ (matrix.report == 'campaign' || matrix.report == 'creative') && '14' || needs.prepare.outputs.lookback }}
           COHORT_LOOKBACK_DAYS: ${{ needs.prepare.outputs.cohort_lookback }}
           START_DATE: ${{ needs.prepare.outputs.start_date }}
           END_DATE: ${{ needs.prepare.outputs.end_date }}
@@ -342,10 +343,10 @@ jobs:
           BQ_DATASET: adjust_data
           BQ_LOCATION: US
 
-          # 🔧 v3.3: campaign sab se bhaari report hai (13 dimensions × 141 apps).
-          #    45-din window par 300-min timeout mein poori nahi hoti —
-          #    2026-09-17 se atki hui thi. Us ke liye chhota window.
-          LOOKBACK_DAYS: ${{ matrix.report == 'campaign' && '14' || needs.prepare.outputs.lookback }}
+          # 🔧 v3.4: campaign + creative sab se bhaari. Loader v3.4 mein campaign
+          #    ke dimensions 23 → 19 kiye (creative + country nikale); window bhi
+          #    chhota rakhte hain — ehtiyatan.
+          LOOKBACK_DAYS: ${{ (matrix.report == 'campaign' || matrix.report == 'creative') && '14' || needs.prepare.outputs.lookback }}
           COHORT_LOOKBACK_DAYS: ${{ needs.prepare.outputs.cohort_lookback }}
           START_DATE: ${{ needs.prepare.outputs.start_date }}
           END_DATE: ${{ needs.prepare.outputs.end_date }}
