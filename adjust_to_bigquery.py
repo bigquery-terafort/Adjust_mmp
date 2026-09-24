@@ -219,18 +219,38 @@ REPORTS: dict[str, dict[str, Any]] = {
     },
     "campaign": {
         "table": "campaign_daily_performance",
+        # 🔧 v3.4 (2026-09-24): CREATIVE aur COUNTRY_CODE nikaal diye.
+        #    🔴 KYUN: 23 dimensions the — day × app × campaign × adgroup ×
+        #       CREATIVE × COUNTRY = karoron rows. Report 2026-09-17 se chal hi
+        #       nahi rahi thi (7 din atki), aur CORE mein hone ki wajah se poora
+        #       workflow LAAL kar rahi thi. Muqabla: `spend` ke 11 dimensions par
+        #       1.9M rows aaram se chal gaye.
+        #    Creative-level ab apne `creative` report mein hai (OPTIONAL),
+        #    country-level `country` report mein pehle se maujood hai.
         "dimensions": [
             "day", "app", "app_token", "os_name", "platform",
             "partner_name", "partner", "partner_id", "channel", "network",
             "ad_account_id",
             "campaign", "campaign_network", "campaign_id_network",
             "adgroup", "adgroup_network", "adgroup_id_network",
-            "creative", "creative_network", "creative_id_network",
             "source_network", "source_id_network",
-            "country_code",
         ],
-        "cluster": ["app_token", "partner", "campaign_id_network", "country_code"],
-        "desc": "MMP attribution / campaign / adgroup / creative",
+        "cluster": ["app_token", "partner", "campaign_id_network"],
+        "desc": "MMP attribution / campaign / adgroup (creative alag report mein)",
+    },
+    "creative": {
+        # 🆕 v3.4: campaign se nikala hua creative-level hissa. OPTIONAL hai —
+        #    bhaari hai, fail ho to CORE ko nahi girata.
+        "table": "creative_daily_performance",
+        "dimensions": [
+            "day", "app", "app_token", "os_name",
+            "partner_name", "partner", "network",
+            "campaign_network", "campaign_id_network",
+            "adgroup_network", "adgroup_id_network",
+            "creative", "creative_network", "creative_id_network",
+        ],
+        "cluster": ["app_token", "partner", "creative_id_network"],
+        "desc": "creative-level attribution (bhaari — OPTIONAL)",
     },
     "country": {
         "table": "country_daily_performance",
@@ -824,6 +844,14 @@ def negotiate_metrics(dimensions: list[str], candidates: list[str], token: str,
     supported = [m for m in unique_candidates if m in found]
     dropped = [m for m in unique_candidates if m not in found]
     log.info("Metrics supported %d/%d", len(supported), len(unique_candidates))
+    if not supported and unique_candidates:
+        # 🔴 v3.4: yahi wajah hoti hai jab report bilkul khali aata hai.
+        log.error("🔴 KOI METRIC QUBOOL NAHI HUI — dimensions=%s | ad_spend_mode=%s | cohort_maturity=%s",
+                  dimensions, ad_spend_mode, cohort_maturity)
+        log.error("   Pehli 10 candidates: %s", ", ".join(unique_candidates[:10]))
+        log.error("   Aksar wajah: (a) koi dimension is metric family ke saath allowed nahi,")
+        log.error("                (b) Adjust plan mein ye metrics nahi,")
+        log.error("                (c) ad_spend_mode / cohort_maturity ka combo support nahi.")
     if dropped:
         log.info("Unsupported/plan-gated metric candidates (%d): %s%s",
                  len(dropped), ", ".join(dropped[:30]), " ..." if len(dropped) > 30 else "")
@@ -1035,7 +1063,16 @@ def atomic_replace_window(client: bigquery.Client, table_name: str, rows: list[d
     MAGAR sirf tab jab us window mein pehle se kuch na ho (v3.3 khali-jawab guard).
     """
     if not ok_tokens:
-        record_failure(table_name, "no successful app tokens")
+        # 🔧 v3.4: pehle yahan se seedha return tha — table BANTI HI NAHI thi.
+        #    (cohort_daily_performance isi wajah se kabhi nahi bani.)
+        try:
+            ensure_table(client, table_name, schema, cluster)
+            log.warning("⚠️  %s: khali table bana di (koi kaamyab app token nahi)", table_name)
+        except Exception as exc:
+            log.warning("⚠️  %s: khali table bhi nahi ban saki: %s", table_name, exc)
+        record_failure(table_name,
+                       "koi kaamyab app token nahi — har chunk fail hua YA koi metric "
+                       "qubool nahi hui. Upar 'Metrics supported 0/N' dekhein.")
         return
     target = ensure_table(client, table_name, schema, cluster)
 
@@ -1365,7 +1402,10 @@ def run_cohort_report(client: bigquery.Client | None, tokens: list[str], start: 
         supported = negotiate_metrics(dims, candidates, tokens[0], sample_start, sample_end,
                                       ad_spend_mode=AD_SPEND_MODE, cohort_maturity=maturity)
         if not supported:
-            log.warning("No cohort metrics supported for maturity=%s", maturity)
+            # 🔧 v3.4: pehle sirf warning thi — dono maturity fail hone par report
+            #    chup-chaap khali chali jati thi aur table hi nahi banti thi.
+            record_failure(f"cohort:{maturity}",
+                           "koi cohort metric qubool nahi hui (upar 'KOI METRIC QUBOOL NAHI HUI' dekhein)")
             continue
         for ci, app_chunk, raw in fetch_app_chunks_parallel(
                 tokens, start, end, dims, supported, f"cohort:{maturity}",
