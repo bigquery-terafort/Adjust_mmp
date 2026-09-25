@@ -119,7 +119,11 @@ jobs:
           PROFILE='manual'
           LOOKBACK="$INPUT_LOOKBACK"
           COHORT_LOOKBACK="$INPUT_COHORT_LOOKBACK"
-          REPORTS="$INPUT_REPORTS"
+          # 🔴 v3.7 FIX: default sirf `schedule` par set hota tha. Manual run
+          #    (workflow_dispatch) mein `reports` khali chhodo to REPORTS='' ho
+          #    jata tha → python "No valid reports selected" → exit 1 → run 1
+          #    minute mein fail. (2026-09-25 06:22 par yehi hua.)
+          REPORTS="${INPUT_REPORTS:-app,campaign,country,spend,cohort,event,event_cohort}"
           COHORT_PERIODS="$INPUT_COHORT_PERIODS"
           EVENT_PERIODS="$INPUT_EVENT_PERIODS"
           INCLUDE_WM="$INPUT_INCLUDE_WM"
@@ -144,7 +148,11 @@ jobs:
           fi
 
           # 🔧 v3.3: CORE aur OPTIONAL alag alag matrix.
-          eval "$(REPORTS="$REPORTS" python - <<'PY'
+          # 🔴 v3.7 FIX: `eval "$(python ...)"` python ka EXIT CODE chupa deta
+          #    hai. Python fail karta, eval kaamyab dikhta, aur agli line
+          #    "MATRIX_CORE: unbound variable" par marti — asal wajah kabhi
+          #    log mein nahi aati thi. Ab exit code check hota hai.
+          if ! MATRIX_OUT=$(REPORTS="$REPORTS" python - <<'PY'
           import json, os
           CORE     = ['app', 'campaign', 'country', 'event']
           OPTIONAL = ['spend', 'cohort', 'event_cohort']
@@ -159,7 +167,16 @@ jobs:
           print("HAS_CORE='%s'" % ('1' if core else '0'))
           print("HAS_OPT='%s'"  % ('1' if opt  else '0'))
           PY
-          )"
+          ); then
+            echo "::error::Reports list galat hai (REPORTS='$REPORTS'). Sahi values: app, campaign, country, spend, cohort, event, event_cohort"
+            exit 1
+          fi
+          eval "$MATRIX_OUT"
+
+          # 🛡️ Agar eval ke baad bhi set na hon to abhi saaf error do,
+          #    agli line par "unbound variable" ka paheli nahi.
+          : "${MATRIX_CORE:?matrix_core set nahi hua}"
+          : "${MATRIX_OPT:?matrix_optional set nahi hua}"
 
           echo "matrix_core=$MATRIX_CORE"     >> "$GITHUB_OUTPUT"
           echo "matrix_optional=$MATRIX_OPT"  >> "$GITHUB_OUTPUT"
