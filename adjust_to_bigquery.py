@@ -162,6 +162,50 @@ ALLOW_EMPTY_WIPE = os.environ.get("ALLOW_EMPTY_WIPE", "0").strip() == "1"
 #  HAL: rows ko memory mein jama karne ke bajaye seedha STAGING table mein
 #  bhejte raho (batch by batch), aur aakhir mein ek atomic swap. Memory kabhi
 #  ek batch se zyada nahi hoti. DATA POORA AATA HAI — kuch kaata nahi.
+# ══ 🔑 v4.0 — SIZING AB YAHAN, WORKFLOW MEIN NAHI ═════════════════════════
+#  Pehle ye sab GitHub expressions mein tha:
+#      MAX_WORKERS: ${{ (contains('campaign cohort', matrix.report) && ...) || ... }}
+#  Wo do jagah likhna parta tha (sync_core + sync_optional), parhne mein
+#  mushkil tha, aur ek jagah badlo to doosri bhool jate the.
+#  Ab loader khud jaanta hai kaunsi report kitni bhaari hai.
+#
+#  USOOL (2026-09-25 ke saboot se):
+#     spend (11 dims) 1.9M rows ke saath CHAL GAYA — 23-dim campaign MAR GAYA.
+#     Bhaari report = zyada fields per row = bara JSON response.
+#     Aise report ko CHHOTA chunk aur KAM workers chahiye, zyada nahi.
+#  `capped: 1` = ye report BHAARI hai. `speed=max` is ko UPAR nahi le ja sakta.
+#  🔴 KYUN: campaign 12 workers × 50 apps par runner OOM kar gaya tha
+#     ("The operation was canceled." — 2026-09-24). Chhat na ho to `max`
+#     chunkar wahi ghalti dobara karega. Neeche jaana (balanced) hamesha theek.
+REPORT_TUNING: dict[str, dict[str, int]] = {
+    #  report          workers  apps/request  date-chunk (din)  chhat?
+    "campaign":      {"workers": 4,  "chunk": 10, "date_days": 7,  "capped": 1},
+    "cohort":        {"workers": 4,  "chunk": 10, "date_days": 15, "capped": 1},
+    "event_cohort":  {"workers": 4,  "chunk": 10, "date_days": 15, "capped": 1},
+    "spend":         {"workers": 6,  "chunk": 15, "date_days": 0,  "capped": 1},
+    "app":           {"workers": 12, "chunk": 50, "date_days": 0,  "capped": 0},
+    "country":       {"workers": 10, "chunk": 40, "date_days": 0,  "capped": 0},
+    "event":         {"workers": 10, "chunk": 40, "date_days": 0,  "capped": 0},
+}
+#  balanced = aadha · fast = jaisa hai · max = doonga (sirf bina-chhat walon par)
+_SPEED_SCALE = {"balanced": 0.5, "fast": 1.0, "max": 2.0}
+SPEED = os.environ.get("SPEED", "fast").strip().lower()
+if SPEED not in _SPEED_SCALE:
+    SPEED = "fast"
+
+
+def _tuned(report: str, key: str, fallback: int) -> int:
+    """Report + speed ke hisaab se value. env var ho to wo hamesha jeet-ti hai."""
+    cfg = REPORT_TUNING.get(report, {})
+    base = cfg.get(key, fallback)
+    if key == "date_days":
+        return base                      # date-chunk speed se nahi badalta
+    scaled = max(1, int(round(base * _SPEED_SCALE[SPEED])))
+    if cfg.get("capped") and scaled > base:
+        return base                      # 🔒 bhaari report: upar nahi ja sakti
+    return scaled
+
+
 STREAM_FLUSH_ROWS = max(1000, int(os.environ.get("STREAM_FLUSH_ROWS", "50000")))
 
 #  🔑 v3.6: buffer ki asal HAD — bytes mein. Row count report ke hisaab se
@@ -195,6 +239,30 @@ ENABLED_REPORTS = [x.strip().lower() for x in os.environ.get(
     "REPORTS",
     "app,campaign,country,cohort,event,event_cohort,spend",
 ).split(",") if x.strip()]
+
+# ══ 🔑 v4.0: AB TUNING LAGAO ══════════════════════════════════════════════
+#  Workflow ek hi report per job chalata hai (matrix), is liye ENABLED_REPORTS
+#  mein aam tor par ek hi naam hota hai — usi ka wazan dekh kar sizing.
+#  Agar kai reports ek saath hon to sab se BHAARI wali ka wazan lete hain
+#  (mehfooz taraf).
+_ACTIVE = ENABLED_REPORTS[0] if len(ENABLED_REPORTS) == 1 else min(
+    ENABLED_REPORTS, key=lambda r: REPORT_TUNING.get(r, {}).get("workers", 99),
+    default="app")
+
+if "MAX_WORKERS" not in os.environ:
+    MAX_WORKERS = _tuned(_ACTIVE, "workers", 6)
+if "MAX_HTTP_IN_FLIGHT" not in os.environ:
+    MAX_HTTP_IN_FLIGHT = MAX_WORKERS
+    # 🔑 gate yahan NAHI banate — `_AdaptiveGate` class neeche define hoti hai.
+    #    Wahan ye value apne aap uthai jayegi.
+if "CHUNK_SIZE" not in os.environ:
+    CHUNK_SIZE = _tuned(_ACTIVE, "chunk", 25)
+if "DATE_CHUNK_DAYS" not in os.environ:
+    DATE_CHUNK_DAYS = _tuned(_ACTIVE, "date_days", 0)
+
+log.info("⚙️  tuning [%s] speed=%s → workers=%d · chunk=%d apps · date_chunk=%s din",
+         _ACTIVE, SPEED, MAX_WORKERS, CHUNK_SIZE,
+         DATE_CHUNK_DAYS if DATE_CHUNK_DAYS else "poora")
 
 APP_TOKENS_ENV = os.environ.get("ADJUST_APP_TOKENS", "")
 APP_TOKENS_FILE = os.environ.get("APP_TOKENS_FILE", "app_tokens.txt")
@@ -1996,7 +2064,7 @@ def main() -> None:
     #    step isi ko grep karta hai. Badlo to workflow bhi badalna parega.
     # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI — workflow ka "Verify loader" grep.
     # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI — workflow ka "Verify loader" grep.
-    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT | loader v3.7 (right-sized + RAM log)")
+    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT | loader v4.0 (self-tuning)")
     log.info("Workers: %d | max Adjust HTTP in-flight: %d | persist_catalogs=%s", MAX_WORKERS, MAX_HTTP_IN_FLIGHT, PERSIST_CATALOGS)
     for name, value in (
         ("ADJUST_API_TOKEN", ADJUST_API_TOKEN),
