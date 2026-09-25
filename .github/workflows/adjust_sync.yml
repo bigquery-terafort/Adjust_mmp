@@ -1,364 +1,2264 @@
-name: Adjust → BigQuery Sync (v3.2 — parallel reports)
+"""
+Adjust Report Service -> BigQuery · COMPLETE REPORTING WAREHOUSE v3.0
+=====================================================================
+Purpose
+-------
+Pull the maximum practical/defensible coverage available from Adjust's
+AGGREGATED Report Service API into BigQuery for product, monetization and UA
+analysis.
 
-on:
-  schedule:
-    # Daily refresh Mon-Sat
-    - cron: '17 2 * * 1-6'
-    # Weekly deep refresh Sunday
-    - cron: '47 3 * * 0'
+Important boundary
+------------------
+Report Service is aggregated data. It is NOT raw user/device-level data.
+For user-level installs/sessions/events/reattributions/ad revenue/uninstalls,
+also enable Adjust Raw Data Export -> Cloud Storage and load that separately.
 
-  workflow_dispatch:
-    inputs:
-      speed:
-        description: 'Raftaar: max = sab se tez · fast = tez · balanced = mehfooz (429 par isko chunein)'
-        required: false
-        default: 'max'
-        type: choice
-        options: ['max', 'fast', 'balanced']
-      allow_empty_wipe:
-        description: 'API 0 rows de to bhi purana data hata dein? (khatarnak — normally 0)'
-        required: false
-        default: '0'
-        type: choice
-        options: ['0', '1']
-      lookback_days:
-        description: 'Flat reports rolling window (days)'
-        required: false
-        default: '14'
-      cohort_lookback_days:
-        description: 'Cohort rolling window (days)'
-        required: false
-        default: '150'
-      chunk_size:
-        description: 'App tokens per Adjust request'
-        required: false
-        default: '25'
-      metric_batch_size:
-        description: 'Metrics per Adjust request batch'
-        required: false
-        default: '35'
-      reports:
-        description: 'Comma-separated: app,campaign,country,spend,cohort,event,event_cohort'
-        required: false
-        default: 'app,campaign,country,spend,cohort,event,event_cohort'
-      cohort_periods:
-        description: 'all_days | all_periods | key | comma list'
-        required: false
-        default: 'all_days'
-      event_cohort_periods:
-        description: 'key | all_days | comma list'
-        required: false
-        default: 'key'
-      include_weekly_monthly_cohorts:
-        description: '1 = include weekly/monthly cohort periods'
-        required: false
-        default: '0'
-      start_date:
-        description: 'Optional YYYY-MM-DD backfill start'
-        required: false
-        default: ''
-      end_date:
-        description: 'Optional YYYY-MM-DD backfill end'
-        required: false
-        default: ''
-      dry_run:
-        description: '1 = no BigQuery writes'
-        required: false
-        default: '0'
+Major v3 fixes vs v2.x
+----------------------
+1. Uses documented `attribution_types` (plural), not `attribution_type`.
+2. Uses Adjust Events endpoint to discover real event slugs per app.
+3. Uses Filters Data endpoint to discover dimensions/cohort periods/options.
+4. Supports D0-D120 cohort periods (plus optional W/M periods).
+5. Cohorts are stored LONG: one row per cohort_period, avoiding thousands of
+   metric columns and BigQuery column explosion.
+6. Event cohorts are stored LONG by event_slug + cohort_period.
+7. Stable network IDs (campaign/adgroup/creative IDs) are requested.
+8. Metric requests are chunked and merged by dimensions.
+9. Supported metrics/dimensions are negotiated with divide-and-conquer probes.
+10. Successful zero-row responses correctly CLEAR stale data for the window.
+11. Writes use staging + a BigQuery transaction, so failed loads never leave a
+    production table half-deleted.
+12. Separate spend reconciliation table can store adjust/network/mixed cost.
+13. Separate mature + immature cohort snapshots are supported.
+14. Rolling cohort window defaults to 150 days so D120 can mature.
+15. Catalog tables store what Adjust says is available (dimensions, periods,
+    events, filter options) for auditability and future schema changes.
 
-concurrency:
-  group: adjust-bigquery-sync-v32
-  cancel-in-progress: false
+Recommended scheduled defaults
+------------------------------
+REPORTS=app,campaign,country,cohort,event,event_cohort,spend
+LOOKBACK_DAYS=14
+COHORT_LOOKBACK_DAYS=150
+COHORT_MATURITIES=immature,mature
+AD_SPEND_MODE=network
+SPEND_RECON_MODES=adjust,network,mixed
+ATTRIBUTION_SOURCE=dynamic
 
-permissions:
-  contents: read
+For all D0-D120 event cohort periods, set:
+EVENT_COHORT_PERIODS=all_days
+This can be API-expensive if you have many custom events. The default uses the
+most decision-useful periods while the general cohort table still stores D0-D120.
 
-jobs:
-  prepare:
-    name: Build Adjust run profile
-    runs-on: ubuntu-latest
-    # 🔑 v4.0: har job par timeout. Bina iske GitHub 6 ghante tak chalne deta
-    #    hai — ek atka hua job poore din ke runner minutes kha jata hai.
-    #    validate.yml ka usool isi ko pakadta hai.
-    timeout-minutes: 10
-    outputs:
-      # 🔧 v3.3: DO matrix. CORE reports ka fail hona workflow LAAL karta hai;
-      #    OPTIONAL (spend/cohort/event_cohort) abhi tajurbati hain — un ka fail
-      #    hona CORE ko nahi girata. (2026-09-23: teen run LAAL huin sirf optional
-      #    ki wajah se, jabke app/country/event kaamyab the.)
-      matrix: ${{ steps.profile.outputs.matrix }}
-      lookback: ${{ steps.profile.outputs.lookback }}
-      cohort_lookback: ${{ steps.profile.outputs.cohort_lookback }}
-      chunk: ${{ steps.profile.outputs.chunk }}
-      metric_batch: ${{ steps.profile.outputs.metric_batch }}
-      cohort_periods: ${{ steps.profile.outputs.cohort_periods }}
-      event_periods: ${{ steps.profile.outputs.event_periods }}
-      include_wm: ${{ steps.profile.outputs.include_wm }}
-      start_date: ${{ steps.profile.outputs.start_date }}
-      end_date: ${{ steps.profile.outputs.end_date }}
-      dry_run: ${{ steps.profile.outputs.dry_run }}
-      profile: ${{ steps.profile.outputs.profile }}
-    steps:
-      - name: Build profile + report matrix
-        id: profile
-        shell: bash
-        env:
-          INPUT_LOOKBACK: ${{ inputs.lookback_days || '14' }}
-          INPUT_COHORT_LOOKBACK: ${{ inputs.cohort_lookback_days || '150' }}
-          INPUT_CHUNK: ${{ inputs.chunk_size || '25' }}
-          INPUT_METRIC_BATCH: ${{ inputs.metric_batch_size || '35' }}
-          INPUT_REPORTS: ${{ inputs.reports || 'app,campaign,country,spend,cohort,event,event_cohort' }}
-          INPUT_COHORT_PERIODS: ${{ inputs.cohort_periods || 'all_days' }}
-          INPUT_EVENT_PERIODS: ${{ inputs.event_cohort_periods || 'key' }}
-          INPUT_INCLUDE_WM: ${{ inputs.include_weekly_monthly_cohorts || '0' }}
-          INPUT_START_DATE: ${{ inputs.start_date || '' }}
-          INPUT_END_DATE: ${{ inputs.end_date || '' }}
-          INPUT_DRY_RUN: ${{ inputs.dry_run || '0' }}
-        run: |
-          set -euo pipefail
+Required env
+------------
+ADJUST_API_TOKEN
+GCP_PROJECT
+GCP_CREDENTIALS_JSON
+ADJUST_APP_TOKENS   comma separated, OR APP_TOKENS_FILE
 
-          # 🔴 v4.1 FIX — MANUAL RUN PAR DEFAULTS
-          #
-          #    Ye workflow hamesha `schedule` se chalti thi, aur defaults sirf
-          #    us shaakh mein set hote the (neeche `if event_name == schedule`).
-          #    Jab "Run workflow" se MANUAL chalayi gayi aur inputs khali
-          #    chhode gaye, to LOOKBACK='' · METRIC_BATCH='' · CHUNK='' … chale
-          #    gaye. Loader ne `int('')` kiya → ValueError → foran maut, koi log
-          #    nahi, GitHub ne sirf "exit code 1" likha.
-          #    (2026-09-25 run #93 — line 133 par.)
-          #
-          #    Ab har value ka manual default hai, bilkul wahi jo daily profile
-          #    use karta hai. Loader mein bhi `_env_int` guard hai — do taraf se.
-          PROFILE='manual'
-          LOOKBACK="${INPUT_LOOKBACK:-14}"
-          COHORT_LOOKBACK="${INPUT_COHORT_LOOKBACK:-150}"
-          REPORTS="${INPUT_REPORTS:-app,campaign,country,spend,cohort,event,event_cohort}"
-          COHORT_PERIODS="${INPUT_COHORT_PERIODS:-all_days}"
-          EVENT_PERIODS="${INPUT_EVENT_PERIODS:-key}"
-          INCLUDE_WM="${INPUT_INCLUDE_WM:-0}"
+Optional env
+------------
+BQ_DATASET=adjust_data
+BQ_LOCATION=US
+LOOKBACK_DAYS=14
+COHORT_LOOKBACK_DAYS=150
+CHUNK_SIZE=25
+METRIC_BATCH_SIZE=35
+MAX_WORKERS=6                       # bounded Adjust/API concurrency
+MAX_HTTP_IN_FLIGHT=6                # hard cap across all worker pools
+MAX_RETRIES=6
+REQUEST_TIMEOUT=300
+UTC_OFFSET=+00:00
+REPORTING_CURRENCY=USD
+AD_SPEND_MODE=network
+SPEND_RECON_MODES=adjust,network,mixed
+ATTRIBUTION_SOURCE=dynamic
+ATTRIBUTION_TYPES=                 # empty = Adjust default/all available
+COHORT_MATURITIES=immature,mature
+COHORT_PERIODS=all_days            # all_days | key | comma slugs e.g. d0,d1,d7
+EVENT_COHORT_PERIODS=key           # all_days | key | comma slugs
+INCLUDE_WEEKLY_MONTHLY_COHORTS=0
+REPORTS=app,campaign,country,cohort,event,event_cohort,spend
+START_DATE=                         # YYYY-MM-DD optional backfill override
+END_DATE=                           # YYYY-MM-DD optional backfill override
+DRY_RUN=0
 
-          if [[ '${{ github.event_name }}' == 'schedule' ]]; then
-            REPORTS='app,campaign,country,spend,cohort,event,event_cohort'
-            if [[ '${{ github.event.schedule }}' == '47 3 * * 0' ]]; then
-              PROFILE='weekly-deep'
-              LOOKBACK='30'
-              COHORT_LOOKBACK='180'
-              COHORT_PERIODS='all_periods'
-              EVENT_PERIODS='all_days'
-              INCLUDE_WM='1'
-            else
-              PROFILE='daily'
-              LOOKBACK='14'
-              COHORT_LOOKBACK='150'
-              COHORT_PERIODS='all_days'
-              EVENT_PERIODS='key'
-              INCLUDE_WM='0'
-            fi
-          fi
+Docs checked: 2026-09-23
+"""
 
-          # 🔧 v3.3: CORE aur OPTIONAL alag alag matrix.
-          # 🔴 v3.7 FIX: `eval "$(python ...)"` python ka EXIT CODE chupa deta
-          #    hai. Python fail karta, eval kaamyab dikhta, aur agli line
-          #    "MATRIX_CORE: unbound variable" par marti — asal wajah kabhi
-          #    log mein nahi aati thi. Ab exit code check hota hai.
-          # 🔑 v4.0: EK matrix. Har entry mein `report` + `optional` flag.
-          #    Pehle DO matrix aur DO jobs the — wahi ~100 lines do jagah, aur
-          #    har fix do baar karna parta tha (ek bhool = bug).
-          if ! MATRIX_OUT=$(REPORTS="$REPORTS" python - <<'PY'
-          import json, os
-          # 🔑 v4.3 — CORE = wo reports jo SAABIT tor par chalti hain.
-          #    campaign 2026-09-17 se atki hui hai; CORE mein hone ki wajah se
-          #    poora workflow LAAL kar rahi thi, jabke country/event/spend ka
-          #    data roz theek aa raha tha (925k / 62k / 2.6M rows — 25 Sep).
-          #    Ab campaign OPTIONAL hai: fail ho to bhi workflow GREEN, aur
-          #    baqi ka data rukta nahi. Jab campaign theek ho jaye, us ka naam
-          #    wapas CORE mein daal dena.
-          CORE     = ['app', 'country', 'event']
-          OPTIONAL = ['campaign', 'spend', 'cohort', 'event_cohort']
-          requested = {x.strip() for x in os.environ['REPORTS'].split(',') if x.strip()}
-          entries = ([{'report': r, 'optional': False} for r in CORE     if r in requested]
-                   + [{'report': r, 'optional': True}  for r in OPTIONAL if r in requested])
-          if not entries:
-              raise SystemExit('No valid reports selected')
-          print("MATRIX='%s'" % json.dumps({'include': entries}, separators=(',', ':')))
-          PY
-          ); then
-            echo "::error::Reports list galat hai (REPORTS='$REPORTS'). Sahi: app, campaign, country, spend, cohort, event, event_cohort"
-            exit 1
-          fi
-          eval "$MATRIX_OUT"
-          : "${MATRIX:?matrix set nahi hua}"
+from __future__ import annotations
 
-          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
-          echo "lookback=$LOOKBACK" >> "$GITHUB_OUTPUT"
-          echo "cohort_lookback=$COHORT_LOOKBACK" >> "$GITHUB_OUTPUT"
-          echo "chunk=${INPUT_CHUNK:-25}" >> "$GITHUB_OUTPUT"
-          echo "metric_batch=${INPUT_METRIC_BATCH:-35}" >> "$GITHUB_OUTPUT"
-          echo "cohort_periods=$COHORT_PERIODS" >> "$GITHUB_OUTPUT"
-          echo "event_periods=$EVENT_PERIODS" >> "$GITHUB_OUTPUT"
-          echo "include_wm=$INCLUDE_WM" >> "$GITHUB_OUTPUT"
-          # start_date / end_date jaan-boojh ke khali rehte hain — loader
-          # khali ko "lookback use karo" samajhta hai (ye number nahi hain).
-          echo "start_date=$INPUT_START_DATE" >> "$GITHUB_OUTPUT"
-          echo "end_date=$INPUT_END_DATE" >> "$GITHUB_OUTPUT"
-          echo "dry_run=${INPUT_DRY_RUN:-0}" >> "$GITHUB_OUTPUT"
-          echo "profile=$PROFILE" >> "$GITHUB_OUTPUT"
+import json
+import logging
+import os
+import random
+import re
+import sys
+import threading
+import time
+import uuid
+import itertools
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Iterable
 
-          echo "Profile: $PROFILE"
-          echo "Matrix: $MATRIX"
-          echo "Flat lookback: $LOOKBACK"
-          echo "Cohort lookback: $COHORT_LOOKBACK"
+import requests
+from google.api_core import exceptions as gexc
+from google.cloud import bigquery
+from google.oauth2 import service_account
 
-  sync:
-    name: Adjust ${{ matrix.report }} → BigQuery
-    # 🔑 v4.0: OPTIONAL reports fail hon to workflow LAAL na ho. Flag matrix se
-    #    aata hai — alag job ki zaroorat nahi.
-    continue-on-error: ${{ matrix.optional }}
-    needs: prepare
-    runs-on: ubuntu-latest
-    timeout-minutes: 300
-    strategy:
-      fail-fast: false
-      # 🔑 v3.5: CHAARON core reports EK SAATH. Pehle 2 the — campaign ko apni
-      #    bari ka intezaar karna parta tha, jis se poori run lambi hoti thi.
-      max-parallel: 4
-      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+# -----------------------------------------------------------------------------
+# Logging / constants
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("adjust_v3")
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+REPORT_ENDPOINT = "https://automate.adjust.com/reports-service/report"
+EVENTS_ENDPOINT = "https://automate.adjust.com/reports-service/events"
+FILTERS_ENDPOINT = "https://automate.adjust.com/reports-service/filters_data"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: pip
+ADJUST_API_TOKEN = os.environ.get("ADJUST_API_TOKEN", "").strip()
+GCP_PROJECT = os.environ.get("GCP_PROJECT", "").strip()
+GCP_CREDENTIALS_JSON = os.environ.get("GCP_CREDENTIALS_JSON", "").strip()
 
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_CREDENTIALS_JSON }}
+BQ_DATASET = os.environ.get("BQ_DATASET", "adjust_data").strip()
+BQ_LOCATION = os.environ.get("BQ_LOCATION", "US").strip()
 
-      - name: Install dependencies
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Verify loader
-        run: |
-          set -euo pipefail
-          test -f adjust_to_bigquery.py
-          python -m py_compile adjust_to_bigquery.py
-          grep -q 'v3.2 PARALLEL-REPORT' adjust_to_bigquery.py || {
-            echo '::error::Repo is not running the v3.2 parallel-report loader'
-            exit 1
-          }
-
-      - name: Run ${{ matrix.report }} report
-        env:
-          ADJUST_API_TOKEN: ${{ secrets.ADJUST_API_TOKEN }}
-          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
-          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
-          ADJUST_APP_TOKENS: ${{ secrets.ADJUST_APP_TOKENS }}
-
-          APP_TOKENS_FILE: app_tokens.txt
-          BQ_DATASET: adjust_data
-          BQ_LOCATION: US
-
-          # 🔑 POORA window — har report ke liye. Bhaari reports ka hal
-          #    streaming + chunking se nikala hai, window kaat kar nahi.
-          LOOKBACK_DAYS: ${{ needs.prepare.outputs.lookback }}
-
-          # 🔑 v3.5 STREAMING: rows memory mein jama karne ke bajaye har 50k par
-          #    staging table mein chale jate hain. Isi se campaign ka OOM gaya —
-          #    "The operation was canceled." ab nahi aayega.
-          # 🔑 v4.0: workers / chunk / date-chunk ab LOADER tay karta hai
-          #    (REPORT_TUNING dict). Pehle multi-line GitHub expressions the,
-          #    do jagah likhe hue, parhne mein na-mumkin.
-          SPEED: ${{ inputs.speed || 'fast' }}
-          STREAM_FLUSH_ROWS: '50000'
-
-          # 🔴 v3.7: buffer ki had 400 MB → 120 MB. Runner par bohot si aur
-          #    cheezein bhi memory leti hain (HTTP responses, JSON parse).
-          STREAM_MAX_BYTES: '120000000'
+def _env_int(name: str, default: int) -> int:
+    """🔴 v4.1 FIX: `os.environ.get(k, "35")` ka default SIRF tab lagta hai jab
+    key maujood HI na ho. GitHub Actions har env var SET karta hai — khali ho to
+    bhi. Yani `METRIC_BATCH_SIZE=""` par `int("")` → ValueError → loader FORAN
+    marta hai, koi log nahi, aur GitHub sirf "Process completed with exit code 1"
+    likhta hai.
+    (2026-09-25: manual run par `prepare` ne lookback/metric_batch khali diye,
+     aur run #93 line 133 par mar gayi — wajah kahin nazar nahi aa rahi thi.)
+    Ab: khali ya kharab value = default, aur log mein saaf warning.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("⚠️  %s='%s' number nahi — default %d le rahe hain", name, raw, default)
+        return default
 
 
-          # 🔑 v3.5 COHORT PERIOD BATCH: 66 families × 121 periods = ~8,000
-          #    metrics ek request mein — negotiation girti thi. 10 ke batches.
-          COHORT_PERIOD_BATCH: '10'
-          COHORT_LOOKBACK_DAYS: ${{ needs.prepare.outputs.cohort_lookback }}
-          START_DATE: ${{ needs.prepare.outputs.start_date }}
-          END_DATE: ${{ needs.prepare.outputs.end_date }}
-
-          METRIC_BATCH_SIZE: ${{ needs.prepare.outputs.metric_batch }}
+def _env_str(name: str, default: str) -> str:
+    """Wahi masla strings par — khali value ko default se badlo."""
+    raw = (os.environ.get(name) or "").strip()
+    return raw if raw else default
 
 
+LOOKBACK_DAYS = _env_int("LOOKBACK_DAYS", 14)
+COHORT_LOOKBACK_DAYS = _env_int("COHORT_LOOKBACK_DAYS", 150)
+CHUNK_SIZE = _env_int("CHUNK_SIZE", 25)
+METRIC_BATCH_SIZE = _env_int("METRIC_BATCH_SIZE", 35)
+MAX_WORKERS = max(1, _env_int("MAX_WORKERS", 6))
+MAX_HTTP_IN_FLIGHT = max(1, _env_int("MAX_HTTP_IN_FLIGHT", MAX_WORKERS))
+PERSIST_CATALOGS = os.environ.get("PERSIST_CATALOGS", "1") == "1"
+MAX_RETRIES = _env_int("MAX_RETRIES", 6)
+REQUEST_TIMEOUT = _env_int("REQUEST_TIMEOUT", 300)
+UTC_OFFSET = os.environ.get("UTC_OFFSET", "+00:00").strip()
+REPORTING_CURRENCY = os.environ.get("REPORTING_CURRENCY", "USD").strip().upper()
+# ══ 🛡️ v3.3 (2026-09-24) — KHALI-JAWAB GUARD ══════════════════════════════
+#  Adjust kabhi kabhi 0 rows ka "kaamyab" jawab deta hai (dimension qubool nahi
+#  hui, ya API sust). Purana code us soorat mein window DELETE kar ke 0 rows
+#  likh deta tha — yani ek khali jawab poora data ura deta tha.
+#  Live saboot (2026-09-23): spend_reconciliation_daily aur
+#  event_cohort_daily_performance dono 0 rows par aa gayin.
+#  Ab: agar 0 rows aayein MAGAR us window mein pehle se data ho → FAIL, DELETE nahi.
+#  Jaan-boojh ke purge karna ho to ALLOW_EMPTY_WIPE=1.
+ALLOW_EMPTY_WIPE = os.environ.get("ALLOW_EMPTY_WIPE", "0").strip() == "1"
+
+# ══ 🔑 v3.5 (2026-09-24) — STREAMING WRITES (OOM ka asal hal) ══════════════
+#  MASLA: loader saarey rows `all_rows` list mein jama karta tha. campaign par
+#  23 dimensions × 150 metrics = 173 fields per row; 141 apps × 14 din ke rows
+#  GitHub runner ki 7 GB RAM kha jate the. Python process OOM-kill hota tha
+#  aur GitHub "The operation was canceled." likhta tha (error nahi — is liye
+#  wajah kabhi saaf nahi hui). campaign_daily_performance 2026-09-17 par atak
+#  gayi thi. Live saboot (run #81, 11:48 UTC):
+#      11:49:18  Metrics supported 150/183     ← negotiation theek
+#      11:52:18  schema +125 fields            ← rows aa rahe the
+#      11:53:26  The operation was canceled    ← OOM
+#
+#  HAL: rows ko memory mein jama karne ke bajaye seedha STAGING table mein
+#  bhejte raho (batch by batch), aur aakhir mein ek atomic swap. Memory kabhi
+#  ek batch se zyada nahi hoti. DATA POORA AATA HAI — kuch kaata nahi.
+# ══ 🔑 v4.0 — SIZING AB YAHAN, WORKFLOW MEIN NAHI ═════════════════════════
+#  Pehle ye sab GitHub expressions mein tha:
+#      MAX_WORKERS: ${{ (contains('campaign cohort', matrix.report) && ...) || ... }}
+#  Wo do jagah likhna parta tha (sync_core + sync_optional), parhne mein
+#  mushkil tha, aur ek jagah badlo to doosri bhool jate the.
+#  Ab loader khud jaanta hai kaunsi report kitni bhaari hai.
+#
+#  USOOL (2026-09-25 ke saboot se):
+#     spend (11 dims) 1.9M rows ke saath CHAL GAYA — 23-dim campaign MAR GAYA.
+#     Bhaari report = zyada fields per row = bara JSON response.
+#     Aise report ko CHHOTA chunk aur KAM workers chahiye, zyada nahi.
+#  `capped: 1` = ye report BHAARI hai. `speed=max` is ko UPAR nahi le ja sakta.
+#  🔴 KYUN: campaign 12 workers × 50 apps par runner OOM kar gaya tha
+#     ("The operation was canceled." — 2026-09-24). Chhat na ho to `max`
+#     chunkar wahi ghalti dobara karega. Neeche jaana (balanced) hamesha theek.
+REPORT_TUNING: dict[str, dict[str, int]] = {
+    #  report          workers  apps/request  date-chunk (din)  chhat?
+    # 🔴 v4.6: cohort/event_cohort par RAM 11 GB tak chali gayi thi (run #98).
+    #    Ek app-chunk × 15-din window = 3.5 LAKH rows. Ab chunk 5 apps aur
+    #    window 5 din — har fetch ~8x chhoti, RAM 1-2 GB mein rehti hai.
+    # 🔴 v4.7: run #99 — campaign 10 apps × 7 din par bhi RAM 10 GB. Ab 3 apps
+    #    × 3 din: har fetch ~8× chhoti. Requests zyada, magar har ek halki.
+    "campaign":      {"workers": 3,  "chunk": 3,  "date_days": 3,  "capped": 1},
+    "cohort":        {"workers": 3,  "chunk": 3,  "date_days": 3,  "capped": 1},
+    "event_cohort":  {"workers": 3,  "chunk": 3,  "date_days": 3,  "capped": 1},
+    "spend":         {"workers": 6,  "chunk": 15, "date_days": 0,  "capped": 1},
+    "app":           {"workers": 12, "chunk": 50, "date_days": 0,  "capped": 0},
+    "country":       {"workers": 10, "chunk": 40, "date_days": 0,  "capped": 0},
+    "event":         {"workers": 10, "chunk": 40, "date_days": 0,  "capped": 0},
+}
+#  balanced = aadha · fast = jaisa hai · max = doonga (sirf bina-chhat walon par)
+_SPEED_SCALE = {"balanced": 0.5, "fast": 1.0, "max": 2.0}
+SPEED = _env_str("SPEED", "fast").lower()
+if SPEED not in _SPEED_SCALE:
+    SPEED = "fast"
 
 
-          # 🔧 v3.5: purana `MAX_HTTP_IN_FLIGHT: '4'` yahan se hataya — wo upar
-          #    wali speed-aware value ko override kar raha tha, jis se 12 workers
-          #    banane ke bawajood sirf 4 requests chal patin (workers khali baithe).
-          MAX_RETRIES: '8'
-          REQUEST_TIMEOUT: '300'
-
-          REPORTS: ${{ matrix.report }}
-          COHORT_PERIODS: ${{ needs.prepare.outputs.cohort_periods }}
-          EVENT_COHORT_PERIODS: ${{ needs.prepare.outputs.event_periods }}
-          INCLUDE_WEEKLY_MONTHLY_COHORTS: ${{ needs.prepare.outputs.include_wm }}
-          COHORT_MATURITIES: 'immature,mature'
-
-          ATTRIBUTION_SOURCE: dynamic
-          ATTRIBUTION_TYPES: ''
-          AD_SPEND_MODE: network
-          SPEND_RECON_MODES: 'adjust,network,mixed'
-
-          REPORTING_CURRENCY: USD
-          UTC_OFFSET: '+00:00'
-          DRY_RUN: ${{ needs.prepare.outputs.dry_run }}
-
-          # 🛡️ v3.3: 0 rows aane par purana data URAYA na jaye.
-          ALLOW_EMPTY_WIPE: ${{ inputs.allow_empty_wipe || '0' }}
-
-          # Only one concurrent matrix job should rewrite the shared catalogs.
-          PERSIST_CATALOGS: ${{ matrix.report == 'app' && '1' || '0' }}
-
-        run: python adjust_to_bigquery.py
-
-      - name: Job summary
-        if: always()
-        run: |
-          {
-            echo "## Adjust report: ${{ matrix.report }}"
-            echo "- Profile: **${{ needs.prepare.outputs.profile }}**"
-            echo "- Result: **${{ job.status }}**"
-            echo "- Per-job workers: **4**"
-            echo "- Per-job HTTP cap: **4**"
-          } >> "$GITHUB_STEP_SUMMARY"
+def _tuned(report: str, key: str, fallback: int) -> int:
+    """Report + speed ke hisaab se value. env var ho to wo hamesha jeet-ti hai."""
+    cfg = REPORT_TUNING.get(report, {})
+    base = cfg.get(key, fallback)
+    if key == "date_days":
+        return base                      # date-chunk speed se nahi badalta
+    scaled = max(1, int(round(base * _SPEED_SCALE[SPEED])))
+    if cfg.get("capped") and scaled > base:
+        return base                      # 🔒 bhaari report: upar nahi ja sakti
+    return scaled
 
 
-  final:
-    name: Adjust sync summary
-    needs: [prepare, sync]
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      # 🔑 v4.0: matrix ki OPTIONAL entries par `continue-on-error: true` hai,
-      #    is liye un ka fail hona `needs.sync.result` ko nahi chhoota.
-      #    Yani `sync.result` = sirf CORE ka nateeja. Bas isi ko dekho.
-      - name: Final result
-        run: |
-          set -uo pipefail
-          R='${{ needs.sync.result }}'
-          {
-            echo "## Adjust sync — ${{ needs.prepare.outputs.profile }}"
-            echo "- CORE (app, campaign, country, event): **$R**"
-            echo "- OPTIONAL (spend, cohort, event_cohort): un ke apne job dekhein"
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "CORE result = $R"
-          if [[ "$R" == 'failure' || "$R" == 'cancelled' ]]; then
-            echo '::error::CORE Adjust report fail hui.'
-            exit 1
-          fi
-          echo '✅ CORE Adjust reports mukammal.'
+STREAM_FLUSH_ROWS = max(1000, _env_int("STREAM_FLUSH_ROWS", 25000))
+
+# 🔴 v4.7 (2026-09-25) — RSS-BASED FLUSH (asal hal)
+#    Run #99 ka log:
+#        flush har 48999 rows · +48999 rows → RAM 3,644 → 4,085 → 6,135 → 10,254 MB
+#    `json.dumps` ne 2,449 bytes/row kaha, magar 49k rows par RAM 4 GB barhi —
+#    yani asal ~80 KB/row. Python dict 173 keys ke saath JSON se 10-30× bara
+#    hota hai. Bytes/row ka andaza BEKAAR hai.
+#    AB: flush ka faisla ASAL RAM par. RSS is had se ooper → foran flush,
+#    chahe buffer mein 500 rows hon. Ye zameen ki haqeeqat hai, andaza nahi.
+STREAM_MAX_RSS_MB = max(500, _env_int("STREAM_MAX_RSS_MB", 2500))
+
+#  🔑 v3.6: buffer ki asal HAD — bytes mein. Row count report ke hisaab se
+#  bilkul alag matlab rakhta hai (campaign row = 173 fields, app row = ~20).
+#  GitHub runner ~16 GB deta hai; 400 MB buffer mehfooz hai aur BigQuery
+#  load job ke liye bhi theek size.
+# 🔴 v4.6: 400 MB → 80 MB. Runner par 4 workers ke responses + JSON parse +
+#    buffer sab ek saath chalte hain. Bara buffer akela hi RAM kha jata tha.
+STREAM_MAX_BYTES = max(20_000_000, _env_int("STREAM_MAX_BYTES", 80_000_000))
+
+#  DATE CHUNKING: har app-chunk ka window bhi chhote tukron mein. 0 = band.
+DATE_CHUNK_DAYS = max(0, _env_int("DATE_CHUNK_DAYS", 0))
+
+#  COHORT PERIOD BATCH: 66 metric families × 121 periods = ~8,000 metrics ek
+#  request mein — negotiation girti thi. 10-period batches mein 660 metrics.
+COHORT_PERIOD_BATCH = max(1, _env_int("COHORT_PERIOD_BATCH", 10))
+
+ALLOW_EMPTY_WIPE = os.environ.get("ALLOW_EMPTY_WIPE", "0").strip() == "1"
+
+AD_SPEND_MODE = _env_str("AD_SPEND_MODE", "network").lower()
+SPEND_RECON_MODES = [x.strip().lower() for x in os.environ.get(
+    "SPEND_RECON_MODES", "adjust,network,mixed").split(",") if x.strip()]
+ATTRIBUTION_SOURCE = os.environ.get("ATTRIBUTION_SOURCE", "dynamic").strip().lower()
+ATTRIBUTION_TYPES = [x.strip() for x in os.environ.get("ATTRIBUTION_TYPES", "").split(",") if x.strip()]
+COHORT_MATURITIES = [x.strip().lower() for x in os.environ.get(
+    "COHORT_MATURITIES", "immature,mature").split(",") if x.strip()]
+COHORT_PERIODS_SETTING = os.environ.get("COHORT_PERIODS", "all_days").strip().lower()
+EVENT_COHORT_PERIODS_SETTING = os.environ.get("EVENT_COHORT_PERIODS", "key").strip().lower()
+INCLUDE_WEEKLY_MONTHLY_COHORTS = os.environ.get("INCLUDE_WEEKLY_MONTHLY_COHORTS", "0") == "1"
+DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
+
+ENABLED_REPORTS = [x.strip().lower() for x in os.environ.get(
+    "REPORTS",
+    "app,campaign,country,cohort,event,event_cohort,spend",
+).split(",") if x.strip()]
+
+# ══ 🔑 v4.0: AB TUNING LAGAO ══════════════════════════════════════════════
+#  Workflow ek hi report per job chalata hai (matrix), is liye ENABLED_REPORTS
+#  mein aam tor par ek hi naam hota hai — usi ka wazan dekh kar sizing.
+#  Agar kai reports ek saath hon to sab se BHAARI wali ka wazan lete hain
+#  (mehfooz taraf).
+_ACTIVE = ENABLED_REPORTS[0] if len(ENABLED_REPORTS) == 1 else min(
+    ENABLED_REPORTS, key=lambda r: REPORT_TUNING.get(r, {}).get("workers", 99),
+    default="app")
+
+if "MAX_WORKERS" not in os.environ:
+    MAX_WORKERS = _tuned(_ACTIVE, "workers", 6)
+if "MAX_HTTP_IN_FLIGHT" not in os.environ:
+    MAX_HTTP_IN_FLIGHT = MAX_WORKERS
+    # 🔑 gate yahan NAHI banate — `_AdaptiveGate` class neeche define hoti hai.
+    #    Wahan ye value apne aap uthai jayegi.
+if "CHUNK_SIZE" not in os.environ:
+    CHUNK_SIZE = _tuned(_ACTIVE, "chunk", 25)
+if "DATE_CHUNK_DAYS" not in os.environ:
+    DATE_CHUNK_DAYS = _tuned(_ACTIVE, "date_days", 0)
+
+log.info("⚙️  tuning [%s] speed=%s → workers=%d · chunk=%d apps · date_chunk=%s din",
+         _ACTIVE, SPEED, MAX_WORKERS, CHUNK_SIZE,
+         DATE_CHUNK_DAYS if DATE_CHUNK_DAYS else "poora")
+
+APP_TOKENS_ENV = os.environ.get("ADJUST_APP_TOKENS", "")
+APP_TOKENS_FILE = os.environ.get("APP_TOKENS_FILE", "app_tokens.txt")
+START_DATE_ENV = os.environ.get("START_DATE", "").strip()
+END_DATE_ENV = os.environ.get("END_DATE", "").strip()
+
+RUN_ID = f"{date.today().isoformat()}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+FAILURES: list[str] = []
+
+SENTINELS = {"unknown", "missing", "n/a", "na", "-", "none", "null", ""}
+RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+
+# Bounded concurrency. Multiple report/event worker pools may exist at once, but
+# this semaphore guarantees that the process never has more than
+# MAX_HTTP_IN_FLIGHT live Adjust HTTP requests.
+class _AdaptiveGate:
+    """🔑 v3.6: KHUD-MUTABIQ HTTP gate.
+
+    MASLA: sahi concurrency pehle se maloom nahi. Zyada rakho to Adjust 429
+    deta hai aur exponential backoff ki wajah se ULTA SUST ho jata hai; kam
+    rakho to waqt zaya. Aur sahi number din/waqt ke hisaab se badalta rehta hai.
+
+    HAL: gate khud seekhta hai.
+       • 429 / 503 aaye        → limit AADHI kar do (kam se kam 2), 60s cooldown
+       • 60s tak saaf chala    → limit +2 (MAX tak wapas)
+    Is se `max` (66) set karna mehfooz ho jata hai: agar Adjust na sambhale to
+    loader khud neeche aa jayega, aur haalat behtar hote hi wapas upar.
+    """
+
+    def __init__(self, limit: int):
+        self.max_limit = max(1, limit)
+        self.limit = self.max_limit
+        self._active = 0
+        self._cv = threading.Condition()
+        self._last_throttle = 0.0
+        self._last_grow = time.monotonic()
+
+    def __enter__(self):
+        with self._cv:
+            while self._active >= self.limit:
+                self._cv.wait(timeout=1.0)
+            self._active += 1
+        return self
+
+    def __exit__(self, *exc):
+        with self._cv:
+            self._active -= 1
+            self._cv.notify()
+        return False
+
+    def penalize(self):
+        """429/503 mila — concurrency aadhi."""
+        now = time.monotonic()
+        with self._cv:
+            if now - self._last_throttle < 5.0:
+                return                      # ek hi mauqe par baar baar na girayein
+            old = self.limit
+            self.limit = max(2, self.limit // 2)
+            self._last_throttle = now
+            self._last_grow = now
+            if self.limit != old:
+                log.warning("🐢 rate-limit: HTTP concurrency %d → %d (khud-mutabiq)", old, self.limit)
+            self._cv.notify_all()
+
+    def maybe_recover(self):
+        """60s saaf chala — thora upar."""
+        now = time.monotonic()
+        with self._cv:
+            if self.limit >= self.max_limit:
+                return
+            if now - self._last_throttle < 60.0 or now - self._last_grow < 60.0:
+                return
+            old = self.limit
+            self.limit = min(self.max_limit, self.limit + 2)
+            self._last_grow = now
+            log.info("🐇 saaf chal raha: HTTP concurrency %d → %d", old, self.limit)
+            self._cv.notify_all()
+
+
+_HTTP_GATE = _AdaptiveGate(MAX_HTTP_IN_FLIGHT)
+_THREAD_LOCAL = threading.local()
+_NEG_CACHE_LOCK = threading.Lock()
+_FAILURE_LOCK = threading.Lock()
+
+def worker_count(items: int) -> int:
+    return max(1, min(MAX_WORKERS, items))
+
+def get_http_session() -> requests.Session:
+    """One requests.Session per worker thread for keep-alive connection reuse."""
+    session = getattr(_THREAD_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update(request_headers())
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=MAX_HTTP_IN_FLIGHT,
+            pool_maxsize=MAX_HTTP_IN_FLIGHT,
+            max_retries=0,
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _THREAD_LOCAL.session = session
+    return session
+
+# -----------------------------------------------------------------------------
+# Report definitions
+# -----------------------------------------------------------------------------
+# Stable IDs are deliberately included. Names can change; IDs are join keys.
+REPORTS: dict[str, dict[str, Any]] = {
+    "app": {
+        "table": "app_daily_performance",
+        "dimensions": [
+            "day", "app", "app_token", "store_id", "store_type",
+            "os_name", "platform", "currency_code",
+        ],
+        "cluster": ["app_token", "os_name", "store_type"],
+        "desc": "app/store/os daily KPIs",
+    },
+    "campaign": {
+        "table": "campaign_daily_performance",
+        "dimensions": [
+            "day", "app", "app_token", "os_name", "platform",
+            "partner_name", "partner", "partner_id", "channel", "network",
+            "ad_account_id",
+            "campaign", "campaign_network", "campaign_id_network",
+            "adgroup", "adgroup_network", "adgroup_id_network",
+            "creative", "creative_network", "creative_id_network",
+            "source_network", "source_id_network",
+            "country_code",
+        ],
+        "cluster": ["app_token", "partner", "campaign_id_network", "country_code"],
+        "desc": "MMP attribution / campaign / adgroup / creative",
+    },
+    "country": {
+        "table": "country_daily_performance",
+        "dimensions": [
+            "day", "app", "app_token", "os_name", "platform",
+            "country", "country_code", "region", "device_type",
+            "partner_name", "network",
+        ],
+        "cluster": ["app_token", "country_code", "os_name"],
+        "desc": "country/business-region/device KPIs",
+    },
+    "spend": {
+        "table": "spend_reconciliation_daily",
+        "dimensions": [
+            "day", "app", "app_token", "partner_name", "partner", "network",
+            "ad_account_id", "campaign_network", "campaign_id_network",
+            "adgroup_network", "adgroup_id_network",
+            "creative_network", "creative_id_network", "country_code",
+        ],
+        "cluster": ["app_token", "partner", "campaign_id_network"],
+        "desc": "adjust/network/mixed spend reconciliation",
+    },
+}
+
+COHORT_DIMENSIONS = [
+    "day", "app", "app_token", "os_name", "platform",
+    "partner_name", "partner", "partner_id", "channel", "network",
+    "campaign_network", "campaign_id_network",
+    "adgroup_network", "adgroup_id_network",
+    "creative_network", "creative_id_network",
+    "country_code",
+]
+
+EVENT_DIMENSIONS = [
+    "day", "app", "app_token", "os_name", "platform",
+    "partner_name", "partner", "network",
+    "campaign_network", "campaign_id_network",
+    "country_code",
+]
+
+# -----------------------------------------------------------------------------
+# Metric candidates
+# -----------------------------------------------------------------------------
+# These cover core conversion, lifecycle, monetization, cost, fraud, assist,
+# subscription and SKAN families. Unsupported/plan-gated metrics are filtered by
+# runtime negotiation instead of silently creating empty columns.
+BASE_METRICS = [
+    # Acquisition / conversion
+    "installs", "clicks", "impressions", "sessions", "events",
+    "click_conversion_rate", "impression_conversion_rate", "ctr",
+    "limit_ad_tracking_installs", "limit_ad_tracking_install_rate",
+    "reattributions", "reattribution_reinstalls", "reinstalls",
+    "first_reinstalls", "first_uninstalls", "first_reattributions",
+    "uninstalls", "uninstall_cohort", "uninstall_rate", "deattributions",
+    "gdpr_forgets", "daus", "waus", "maus",
+    # ATT
+    "att_status_authorized", "att_status_non_determined", "att_status_denied",
+    "att_status_restricted", "att_consent_rate",
+    # Revenue / ads / payer
+    "revenue", "cohort_revenue", "revenue_events", "revenue_per_install",
+    "ad_impressions", "ad_revenue", "cohort_ad_revenue", "ad_rpm",
+    "all_revenue", "cohort_all_revenue", "arpdau", "arpu",
+    # Spend
+    "cost", "adjust_cost", "network_cost", "network_cost_diff",
+    "click_cost", "impression_cost", "install_cost", "event_cost",
+    "paid_clicks", "paid_impressions", "paid_installs",
+    "ecpi", "ecpi_all", "network_ecpi", "ecpc", "ecpm",
+    "cost_per_install", "gross_profit", "roas", "return_on_investment",
+    # Assist / qualifiers
+    "assisted_installs", "qualifiers", "impression_based_qualifiers",
+    "click_based_qualifiers", "assisted_reattributions", "non_assisted_installs",
+    # Fraud basics
+    "rejected_installs", "rejected_install_rate", "rejected_installs_anon_ip",
+    "rejected_installs_invalid_signature", "rejected_install_invalid_signature_rate",
+    # Subscription events / revenue
+    "subscrevnt_activation_events", "subscrevnt_billing_retry_events",
+    "subscrevnt_cancellation_events", "subscrevnt_discounted_offer_events",
+    "subscrevnt_expiration_events", "subscrevnt_first_conversion_events",
+    "subscrevnt_grace_period_events", "subscrevnt_on_hold_events",
+    "subscrevnt_paused_events", "subscrevnt_price_accepted_events",
+    "subscrevnt_reactivation_events", "subscrevnt_refund_events",
+    "subscrevnt_renewal_events", "subscrevnt_trial_started_events",
+    "subscrevnt_revenue", "subscrevnt_unknown_revenue",
+    # InSight / incremental if entitled
+    "average_revenue_per_event", "incremental_revenue", "incremental_roas",
+    # SKAN common
+    "skad_installs", "skad_reinstalls", "skad_total_installs", "skad_qualifiers",
+    "invalid_payloads", "valid_conversions", "network_ad_spend_skan",
+    "skad_revenue_min_roas", "skad_revenue_est_roas", "skad_revenue_max_roas",
+    "skan_total_revenue_min", "skan_total_revenue_est", "skan_total_revenue_max",
+    "skan_ad_rpu_min", "skan_ad_rpu_est", "skan_ad_rpu_max",
+    "skan_iap_rpu_min", "skan_iap_rpu_est", "skan_iap_rpu_max",
+    "general_revenue_events_min", "general_revenue_events_est", "general_revenue_events_max",
+]
+BASE_METRICS += [f"conversion_{i}" for i in range(1, 7)]
+BASE_METRICS += [f"conversion_value_{i}" for i in range(0, 64)]
+BASE_METRICS = list(dict.fromkeys(BASE_METRICS))
+
+SPEND_METRICS = [
+    "cost", "adjust_cost", "network_cost", "network_cost_diff",
+    "click_cost", "impression_cost", "install_cost", "event_cost",
+    "paid_clicks", "paid_impressions", "paid_installs",
+    "clicks", "impressions", "installs", "network_clicks", "network_impressions",
+    "network_installs", "ecpc", "ecpm", "ecpi", "network_ecpi",
+]
+
+# Standardized field -> Adjust API metric template.
+# Period is lower-case: d0..d120, w0..w52, m0..m36.
+COHORT_FAMILIES: dict[str, str] = {
+    # Retention / sessions / engagement
+    "cohort_size": "cohort_size_{p}",
+    "retained_users": "retained_users_{p}",
+    "retention_rate": "retention_rate_{p}",
+    "sessions": "sessions_{p}",
+    "non_install_sessions": "non_install_sessions_{p}",
+    "sessions_per_user": "sessions_per_user_{p}",
+    "time_spent": "time_spent_{p}",
+    "time_spent_rate": "time_spent_rate_{p}",
+    "time_spent_per_user": "time_spent_per_user_{p}",
+    "time_spent_per_active_user": "time_spent_per_active_user_{p}",
+    "time_spent_per_session": "time_spent_per_session_{p}",
+    # Ad monetization
+    "ad_impressions": "ad_impressions_{p}",
+    "ad_impressions_total": "ad_impressions_total_{p}",
+    "ad_impressions_total_in_cohort": "ad_impressions_total_in_cohort_{p}",
+    "ad_revenue": "ad_revenue_{p}",
+    "ad_revenue_total": "ad_revenue_total_{p}",
+    "ad_revenue_total_per_user": "ad_revenue_total_per_user_{p}",
+    "ad_revenue_total_per_paying_user": "ad_revenue_total_per_paying_user_{p}",
+    "ad_revenue_total_in_cohort": "ad_revenue_total_in_cohort_{p}",
+    "ad_rpm": "ad_rpm_{p}",
+    # IAP revenue
+    "revenue": "revenue_{p}",
+    "revenue_per_user": "revenue_per_user_{p}",
+    "revenue_per_paying_user": "revenue_per_paying_user_{p}",
+    "revenue_total": "revenue_total_{p}",
+    "revenue_total_per_user": "revenue_total_per_user_{p}",
+    "revenue_total_per_paying_user": "revenue_total_per_paying_user_{p}",
+    "revenue_total_in_cohort": "revenue_total_in_cohort_{p}",
+    "revenue_events": "revenue_events_{p}",
+    "revenue_events_total": "revenue_events_total_{p}",
+    "revenue_events_per_user": "revenue_events_per_user_{p}",
+    "revenue_events_per_paying_user": "revenue_events_per_paying_user_{p}",
+    # All revenue / LTV / ROAS
+    "all_revenue": "all_revenue_{p}",
+    "all_revenue_per_user": "all_revenue_per_user_{p}",
+    "all_revenue_total": "all_revenue_total_{p}",
+    "all_revenue_total_per_user": "all_revenue_total_per_user_{p}",
+    "all_revenue_total_in_cohort": "all_revenue_total_in_cohort_{p}",
+    "lifetime_value": "lifetime_value_{p}",
+    "lifetime_value_ad": "lifetime_value_ad_{p}",
+    "lifetime_value_iap": "lifetime_value_iap_{p}",
+    "paying_user_lifetime_value": "paying_user_lifetime_value_{p}",
+    "paying_user_lifetime_value_ad": "paying_user_lifetime_value_ad_{p}",
+    "paying_user_lifetime_value_iap": "paying_user_lifetime_value_iap_{p}",
+    "roas": "roas_{p}",
+    "roas_ad": "roas_ad_{p}",
+    "roas_iap": "roas_iap_{p}",
+    # Payer metrics
+    "first_paying_users": "first_paying_users_{p}",
+    "first_paying_users_total": "first_paying_users_total_{p}",
+    "paying_users": "paying_users_{p}",
+    "paying_user_size": "paying_user_size_{p}",
+    "paying_users_rate": "paying_users_rate_{p}",
+    "paying_user_rate": "paying_user_rate_{p}",
+    "paying_users_retention_rate": "paying_users_retention_rate_{p}",
+    "retention_rate_paying_users": "retention_rate_paying_users_{p}",
+    "first_time_paying_user_conversion_rate": "first_time_paying_user_conversion_rate_{p}",
+    "first_time_paying_user_conversion_rate_total": "first_time_paying_user_conversion_rate_total_{p}",
+    "paying_user_conversion_rate": "paying_user_conversion_rate_{p}",
+    "cost_per_first_time_paying_user_total": "cost_per_paying_user_{p}",
+    # Lifecycle
+    "deattributions": "deattributions_{p}",
+    "deattributions_per_user": "deattributions_per_user_{p}",
+    "reattributions": "reattributions_{p}",
+    "reattributions_per_user": "reattributions_per_user_{p}",
+    "reinstalls": "reinstalls_{p}",
+    "first_reinstalls": "first_reinstalls_{p}",
+    "uninstalls": "uninstalls_{p}",
+    "first_uninstalls": "first_uninstalls_{p}",
+    "gdpr_forgets": "gdpr_forgets_{p}",
+}
+
+EVENT_COHORT_FAMILIES: dict[str, str] = {
+    "events": "{e}_{p}_events_cohort",
+    "conversions": "{e}_{p}_conversions_cohort",
+    "revenue": "{e}_{p}_revenue_cohort",
+    "converted_user_size": "{e}_{p}_converted_user_size_cohort",
+    "events_per_conversion": "{e}_{p}_events_per_conversion_cohort",
+    "revenue_per_conversion": "{e}_{p}_revenue_per_conversion_cohort",
+    "events_rate": "{e}_{p}_events_rate_cohort",
+    "conversions_rate": "{e}_{p}_conversions_rate_cohort",
+    "events_cost": "{e}_{p}_events_cost_cohort",
+    "conversions_cost": "{e}_{p}_conversions_cost_cohort",
+    "events_per_period": "{e}_{p}_events_per_period",
+    "revenue_per_period": "{e}_{p}_revenue_per_period",
+}
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def record_failure(where: str, detail: Any) -> None:
+    msg = f"{where}: {detail}"
+    with _FAILURE_LOCK:
+        FAILURES.append(msg)
+    log.error("❌ %s", msg)
+
+
+def die(msg: str) -> None:
+    log.error("=" * 88)
+    log.error("🔴 %s", msg)
+    log.error("=" * 88)
+    raise SystemExit(1)
+
+
+def _clean(v: Any) -> str | None:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return None if s.lower() in SENTINELS else s
+
+
+def _num(v: Any) -> float | None:
+    if v in (None, ""):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def chunked(seq: list[Any], size: int) -> Iterable[list[Any]]:
+    if size <= 0:
+        yield seq
+        return
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def parse_date_env(value: str, name: str) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        die(f"{name} must be YYYY-MM-DD, got {value!r}")
+
+
+def derive_store_keys(store_id: Any, store_type: Any, os_name: Any):
+    sid = _clean(store_id)
+    if not sid:
+        return None, None, None
+    os_l = (_clean(os_name) or "").lower()
+    st_l = (_clean(store_type) or "").lower()
+    if "amazon" in st_l:
+        return None, None, sid.upper()
+    is_ios = "ios" in os_l or "app_store" in st_l or "itunes" in st_l
+    is_android = "android" in os_l or "google" in st_l or "play" in st_l
+    if sid.isdigit():
+        if is_android:
+            return None, None, None
+        try:
+            return None, int(sid), None
+        except ValueError:
+            return None, None, None
+    if "." in sid:
+        if is_ios:
+            return None, None, None
+        return sid.lower(), None, None
+    return None, None, None
+
+
+def load_app_tokens() -> list[str]:
+    if APP_TOKENS_ENV.strip():
+        raw = [x.strip() for x in APP_TOKENS_ENV.split(",")]
+        source = "ADJUST_APP_TOKENS"
+    elif os.path.exists(APP_TOKENS_FILE):
+        with open(APP_TOKENS_FILE, "r", encoding="utf-8") as fh:
+            raw = [ln.split("#", 1)[0].strip() for ln in fh]
+        source = APP_TOKENS_FILE
+    else:
+        die(f"No app tokens: set ADJUST_APP_TOKENS or provide {APP_TOKENS_FILE}")
+    out: list[str] = []
+    seen = set()
+    for t in raw:
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    if not out:
+        die(f"No valid app tokens in {source}")
+    log.info("Apps: %d unique tokens (%s)", len(out), source)
+    return out
+
+
+def request_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {ADJUST_API_TOKEN}", "Accept": "application/json"}
+
+
+def http_get_json(url: str, params: dict[str, Any], label: str, quiet: bool = False):
+    """Return (json_body, error). 204 is a successful empty response."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            # Acquire only for the actual network call; retries sleep outside the gate.
+            with _HTTP_GATE:
+                r = get_http_session().get(url, params=params, timeout=REQUEST_TIMEOUT)
+            if r.status_code == 204:
+                return {}, ""
+            body: Any = None
+            try:
+                body = r.json()
+            except ValueError:
+                pass
+
+            if r.status_code == 200:
+                # 🔑 v3.6: saaf chal raha hai to gate ko dheere dheere wapas upar.
+                _HTTP_GATE.maybe_recover()
+                # 🔴 v3.7: bara response mila to RAM ke saath log karo.
+                if len(body) > 20_000_000:
+                    log.warning("📦 %s: bara response %.0f MB%s",
+                                label, len(body) / 1e6, _rss_hint())
+                return body, ""
+
+            if isinstance(body, dict):
+                detail = body.get("error") or body.get("message") or body.get("detail") or json.dumps(body)
+            else:
+                detail = r.text or ""
+            detail = str(detail)[:700]
+
+            if r.status_code in (401, 403):
+                die(f"Adjust HTTP {r.status_code}: token/permission problem: {detail}")
+
+            if r.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
+                # 🔑 v3.6: 429/503 = "bohot tez ja rahe ho" → gate khud neeche.
+                if r.status_code in (429, 503):
+                    _HTTP_GATE.penalize()
+                retry_after = r.headers.get("Retry-After")
+                wait = int(retry_after) if retry_after and retry_after.isdigit() else min(5 * (2 ** (attempt - 1)), 120)
+                wait += random.uniform(0.0, min(2.0, wait * 0.15))
+                if not quiet:
+                    log.warning("%s HTTP %s; retry %d/%d in %ss", label, r.status_code, attempt, MAX_RETRIES, wait)
+                time.sleep(wait)
+                continue
+            return None, f"HTTP {r.status_code}: {detail}"
+        except requests.exceptions.RequestException as exc:
+            if attempt < MAX_RETRIES:
+                wait = min(5 * (2 ** (attempt - 1)), 120) + random.uniform(0.0, 1.5)
+                if not quiet:
+                    log.warning("%s network error; retry %d/%d in %ss: %s", label, attempt, MAX_RETRIES, wait, exc)
+                time.sleep(wait)
+                continue
+            return None, f"network: {exc}"
+    return None, "retries exhausted"
+
+
+def base_report_params(tokens: list[str], start: date, end: date, dimensions: list[str], metrics: list[str],
+                       *, ad_spend_mode: str | None = None, cohort_maturity: str | None = None) -> dict[str, Any]:
+    p: dict[str, Any] = {
+        "app_token__in": ",".join(tokens),
+        "date_period": f"{start.isoformat()}:{end.isoformat()}",
+        "dimensions": ",".join(dimensions),
+        "metrics": ",".join(metrics),
+        "utc_offset": UTC_OFFSET,
+        "format_dates": "false",
+        "currency": REPORTING_CURRENCY,
+        "attribution_source": ATTRIBUTION_SOURCE,
+    }
+    if ATTRIBUTION_TYPES:
+        p["attribution_types"] = ",".join(ATTRIBUTION_TYPES)
+    if ad_spend_mode:
+        p["ad_spend_mode"] = ad_spend_mode
+    if cohort_maturity:
+        p["cohort_maturity"] = cohort_maturity
+    return p
+
+
+def report_call(tokens: list[str], start: date, end: date, dimensions: list[str], metrics: list[str], label: str,
+                *, ad_spend_mode: str | None = None, cohort_maturity: str | None = None, quiet: bool = False):
+    params = base_report_params(tokens, start, end, dimensions, metrics,
+                                ad_spend_mode=ad_spend_mode, cohort_maturity=cohort_maturity)
+    body, err = http_get_json(REPORT_ENDPOINT, params, label, quiet=quiet)
+    if body is None:
+        return None, err, []
+    if body == {}:
+        return [], "", []
+    if not isinstance(body, dict):
+        return None, "unexpected non-object report response", []
+    warnings = [str(w) for w in (body.get("warnings") or [])]
+    rows = body.get("rows")
+    if rows is None:
+        return None, "response missing rows", warnings
+    if not isinstance(rows, list):
+        return None, "response rows is not a list", warnings
+    return rows, "", warnings
+
+# -----------------------------------------------------------------------------
+# Adjust catalog discovery
+# -----------------------------------------------------------------------------
+def discover_filters() -> dict[str, list[dict[str, Any]]]:
+    wanted = [
+        "dimensions", "full_cohort_periods", "attribution_types", "ad_spend_mode",
+        "cohort_maturity", "currencies", "apps", "apps_network", "attributes",
+        "store_type", "os_names", "platform", "partners", "networks",
+        "ad_revenue_sources", "iap_revenue_mode", "subscription_revenue_mode",
+    ]
+    body, err = http_get_json(FILTERS_ENDPOINT, {"required_filters": ",".join(wanted)}, "filters_data")
+    if body is None:
+        log.warning("Filters Data discovery failed: %s", err)
+        return {}
+    if not isinstance(body, dict):
+        log.warning("Filters Data response not an object")
+        return {}
+    out: dict[str, list[dict[str, Any]]] = {}
+    for k, v in body.items():
+        if isinstance(v, list):
+            out[k] = [x for x in v if isinstance(x, dict)]
+    return out
+
+
+def discover_events(tokens: list[str]) -> list[dict[str, Any]]:
+    body, err = http_get_json(EVENTS_ENDPOINT, {
+        "app_token__in": ",".join(tokens),
+        "tokens_mapping": "true",
+    }, "events")
+    if body is None:
+        log.warning("Events discovery failed: %s", err)
+        return []
+    if not isinstance(body, list):
+        log.warning("Events endpoint returned unexpected shape: %s", type(body).__name__)
+        return []
+    return [x for x in body if isinstance(x, dict) and _clean(x.get("id"))]
+
+
+def catalog_ids(filters: dict[str, list[dict[str, Any]]], key: str) -> set[str]:
+    return {str(x.get("id")) for x in filters.get(key, []) if x.get("id") is not None}
+
+
+def choose_dimensions(desired: list[str], filters: dict[str, list[dict[str, Any]]]) -> list[str]:
+    available = catalog_ids(filters, "dimensions")
+    # If discovery failed, use documented desired list and let report negotiation catch issues.
+    if not available:
+        return desired[:]
+    return [d for d in desired if d in available]
+
+
+def normalize_period_id(x: str) -> str | None:
+    s = str(x).strip().lower().replace(" ", "")
+    # Accept d7, 7d, w3, 3w, m2, 2m.
+    m = re.fullmatch(r"([dwm])(\d+)", s)
+    if m:
+        return f"{m.group(1)}{int(m.group(2))}"
+    m = re.fullmatch(r"(\d+)([dwm])", s)
+    if m:
+        return f"{m.group(2)}{int(m.group(1))}"
+    return None
+
+
+def discovered_periods(filters: dict[str, list[dict[str, Any]]]) -> list[str]:
+    out: set[str] = set()
+    for item in filters.get("full_cohort_periods", []):
+        for value in (item.get("id"), item.get("name"), item.get("short_name")):
+            p = normalize_period_id(str(value or ""))
+            if p:
+                out.add(p)
+    # Guaranteed documented fallback.
+    if not out:
+        out.update(f"d{i}" for i in range(121))
+        if INCLUDE_WEEKLY_MONTHLY_COHORTS:
+            out.update(f"w{i}" for i in range(53))
+            out.update(f"m{i}" for i in range(37))
+    return sorted(out, key=period_sort_key)
+
+
+def period_sort_key(p: str):
+    unit = p[0]
+    n = int(p[1:])
+    return ({"d": 0, "w": 1, "m": 2}.get(unit, 9), n)
+
+
+def select_periods(setting: str, available: list[str]) -> list[str]:
+    key = ["d0", "d1", "d3", "d7", "d14", "d30", "d60", "d90", "d120"]
+    if setting in ("all", "all_days"):
+        chosen = [p for p in available if p.startswith("d")]
+    elif setting == "all_periods":
+        chosen = available[:]
+    elif setting == "key":
+        chosen = [p for p in key if p in set(available)]
+    else:
+        requested = [normalize_period_id(x) for x in setting.split(",")]
+        chosen = [p for p in requested if p and p in set(available)]
+    return chosen or [p for p in key if p in set(available)]
+
+# -----------------------------------------------------------------------------
+# Negotiation
+# -----------------------------------------------------------------------------
+_NEG_DIM_CACHE: dict[tuple[str, ...], list[str]] = {}
+_NEG_METRIC_CACHE: dict[tuple[tuple[str, ...], tuple[str, ...], str, str], list[str]] = {}
+
+
+def warnings_are_problem(warnings: list[str]) -> bool:
+    if not warnings:
+        return False
+    text = " ".join(warnings).lower()
+    suspicious = ["invalid", "unsupported", "unknown", "not available", "not supported", "metric", "dimension"]
+    return any(x in text for x in suspicious)
+
+
+def negotiate_dimensions(dimensions: list[str], token: str, sample_start: date, sample_end: date) -> list[str]:
+    original_key = tuple(dimensions)
+    with _NEG_CACHE_LOCK:
+        cached = _NEG_DIM_CACHE.get(original_key)
+    if cached is not None:
+        return cached
+
+    if "day" not in dimensions:
+        dimensions = ["day"] + dimensions
+    to_probe = [d for d in dimensions if d != "day"]
+
+    def probe_dim(d: str) -> tuple[str, bool, str, list[str]]:
+        rows, err, warns = report_call(
+            [token], sample_start, sample_end, ["day", d], ["installs"],
+            f"probe_dim:{d}", quiet=True,
+        )
+        ok = rows is not None and not warnings_are_problem(warns)
+        return d, ok, err, warns
+
+    results: dict[str, tuple[bool, str, list[str]]] = {}
+    if to_probe:
+        with ThreadPoolExecutor(max_workers=worker_count(len(to_probe)), thread_name_prefix="adjust-dim") as pool:
+            future_map = {pool.submit(probe_dim, d): d for d in to_probe}
+            for fut in as_completed(future_map):
+                d = future_map[fut]
+                try:
+                    _, ok, err, warns = fut.result()
+                except Exception as exc:
+                    ok, err, warns = False, str(exc), []
+                results[d] = (ok, err, warns)
+
+    good = ["day"]
+    for d in to_probe:
+        ok, err, warns = results.get(d, (False, "probe missing", []))
+        if ok:
+            good.append(d)
+        else:
+            log.warning("Dimension not usable: %s (%s %s)", d, err, warns[:1])
+
+    if "app_token" in dimensions and "app_token" not in good:
+        die("Adjust did not accept app_token dimension; cannot safely scope BigQuery replacement")
+    with _NEG_CACHE_LOCK:
+        _NEG_DIM_CACHE[original_key] = good
+    return good
+
+
+def metric_batch_supported(dimensions: list[str], metrics: list[str], token: str,
+                           sample_start: date, sample_end: date, *,
+                           ad_spend_mode: str, cohort_maturity: str | None) -> bool:
+    rows, err, warns = report_call(
+        [token], sample_start, sample_end, dimensions, metrics,
+        f"probe_metrics[{len(metrics)}]", ad_spend_mode=ad_spend_mode,
+        cohort_maturity=cohort_maturity, quiet=True,
+    )
+    return rows is not None and not warnings_are_problem(warns)
+
+
+def negotiate_metrics(dimensions: list[str], candidates: list[str], token: str,
+                      sample_start: date, sample_end: date, *,
+                      ad_spend_mode: str, cohort_maturity: str | None) -> list[str]:
+    unique_candidates = list(dict.fromkeys(candidates))
+    ck = (tuple(dimensions), tuple(unique_candidates), ad_spend_mode or "", cohort_maturity or "")
+    with _NEG_CACHE_LOCK:
+        cached = _NEG_METRIC_CACHE.get(ck)
+    if cached is not None:
+        return cached
+
+    def split_probe(items: list[str]) -> list[str]:
+        if not items:
+            return []
+        if metric_batch_supported(
+            dimensions, items, token, sample_start, sample_end,
+            ad_spend_mode=ad_spend_mode, cohort_maturity=cohort_maturity,
+        ):
+            return items
+        if len(items) == 1:
+            return []
+        mid = len(items) // 2
+        # Recursion stays inside this worker; only top-level metric batches fan out.
+        return split_probe(items[:mid]) + split_probe(items[mid:])
+
+    batches = list(chunked(unique_candidates, METRIC_BATCH_SIZE))
+    found: set[str] = set()
+    if batches:
+        with ThreadPoolExecutor(max_workers=worker_count(len(batches)), thread_name_prefix="adjust-metric") as pool:
+            future_map = {pool.submit(split_probe, batch): i for i, batch in enumerate(batches)}
+            for fut in as_completed(future_map):
+                try:
+                    found.update(fut.result())
+                except Exception as exc:
+                    log.warning("Metric negotiation batch failed: %s", exc)
+
+    # Preserve Adjust candidate order for stable schemas/logging.
+    supported = [m for m in unique_candidates if m in found]
+    dropped = [m for m in unique_candidates if m not in found]
+    log.info("Metrics supported %d/%d", len(supported), len(unique_candidates))
+    if not supported and unique_candidates:
+        log.error("🔴 KOI METRIC QUBOOL NAHI HUI — dimensions=%s | ad_spend_mode=%s | cohort_maturity=%s",
+                  dimensions, ad_spend_mode, cohort_maturity)
+        log.error("   Pehli 10 candidates: %s", ", ".join(unique_candidates[:10]))
+        log.error("   Aksar wajah: (a) koi dimension is metric family ke saath allowed nahi,")
+        log.error("                (b) Adjust plan mein ye metrics nahi,")
+        log.error("                (c) ad_spend_mode / cohort_maturity ka combo support nahi.")
+    if dropped:
+        log.info("Unsupported/plan-gated metric candidates (%d): %s%s",
+                 len(dropped), ", ".join(dropped[:30]), " ..." if len(dropped) > 30 else "")
+    with _NEG_CACHE_LOCK:
+        _NEG_METRIC_CACHE[ck] = supported
+    return supported
+
+
+# -----------------------------------------------------------------------------
+# Fetch + merge metric chunks
+# -----------------------------------------------------------------------------
+def dim_key(row: dict[str, Any], dimensions: list[str]) -> tuple[Any, ...]:
+    return tuple(_clean(row.get(d)) for d in dimensions)
+
+
+def fetch_merged(tokens: list[str], start: date, end: date, dimensions: list[str], metrics: list[str], label: str,
+                 *, ad_spend_mode: str, cohort_maturity: str | None = None):
+    """Fetch metric batches and merge them by requested dimensions.
+
+    Returns None on any batch failure. Returns [] on a successful zero-row result.
+    """
+    merged: dict[tuple[Any, ...], dict[str, Any]] = {}
+    any_success = False
+    for i, batch in enumerate(chunked(metrics, METRIC_BATCH_SIZE), 1):
+        rows, err, warns = report_call(
+            tokens, start, end, dimensions, batch,
+            f"{label}:metric_batch {i}", ad_spend_mode=ad_spend_mode,
+            cohort_maturity=cohort_maturity,
+        )
+        if rows is None:
+            log.error("%s failed: %s", label, err)
+            return None
+        any_success = True
+        for w in warns:
+            log.warning("%s Adjust warning: %s", label, w[:500])
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            k = dim_key(raw, dimensions)
+            rec = merged.setdefault(k, {d: raw.get(d) for d in dimensions})
+            # attr_dependency can contain IDs even when a top-level field is absent.
+            dep = raw.get("attr_dependency")
+            if isinstance(dep, dict):
+                for d in dimensions:
+                    if rec.get(d) in (None, "", "unknown", "missing") and d in dep:
+                        rec[d] = dep.get(d)
+            for m in batch:
+                if m in raw:
+                    rec[m] = raw.get(m)
+        time.sleep(0.05)
+    if not any_success:
+        return None
+    return list(merged.values())
+
+# -----------------------------------------------------------------------------
+# BigQuery schema / loading
+# -----------------------------------------------------------------------------
+def get_bq_client() -> bigquery.Client:
+    if not GCP_CREDENTIALS_JSON:
+        die("GCP_CREDENTIALS_JSON is empty")
+    try:
+        info = json.loads(GCP_CREDENTIALS_JSON)
+    except json.JSONDecodeError as exc:
+        die(f"GCP_CREDENTIALS_JSON invalid: {exc}")
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    return bigquery.Client(project=GCP_PROJECT, credentials=creds, location=BQ_LOCATION)
+
+
+def ensure_dataset(client: bigquery.Client) -> None:
+    ds_ref = f"{GCP_PROJECT}.{BQ_DATASET}"
+    try:
+        client.get_dataset(ds_ref)
+    except gexc.NotFound:
+        ds = bigquery.Dataset(ds_ref)
+        ds.location = BQ_LOCATION
+        client.create_dataset(ds)
+        log.info("Created dataset %s", ds_ref)
+
+
+def schema_for_flat(dimensions: list[str], metrics: list[str], *, extra_fields: list[bigquery.SchemaField] | None = None):
+    fields: list[bigquery.SchemaField] = []
+    for d in dimensions:
+        if d == "day":
+            fields.append(bigquery.SchemaField("date", "DATE", mode="REQUIRED"))
+        elif d == "app_token":
+            fields.append(bigquery.SchemaField("app_token", "STRING", mode="REQUIRED"))
+        else:
+            fields.append(bigquery.SchemaField(d, "STRING"))
+    if "store_id" in dimensions:
+        fields += [
+            bigquery.SchemaField("android_package", "STRING"),
+            bigquery.SchemaField("apple_id", "INTEGER"),
+            bigquery.SchemaField("amazon_asin", "STRING"),
+        ]
+    for m in metrics:
+        fields.append(bigquery.SchemaField(m, "FLOAT"))
+    if extra_fields:
+        fields.extend(extra_fields)
+    fields += [
+        bigquery.SchemaField("_ingested_at", "TIMESTAMP", mode="REQUIRED"),
+        bigquery.SchemaField("_run_id", "STRING", mode="REQUIRED"),
+    ]
+    return dedupe_schema(fields)
+
+
+def dedupe_schema(fields: list[bigquery.SchemaField]) -> list[bigquery.SchemaField]:
+    out = []
+    seen = set()
+    for f in fields:
+        if f.name not in seen:
+            seen.add(f.name)
+            out.append(f)
+    return out
+
+
+def cohort_schema(dimensions: list[str], fields: list[str], *, event: bool = False):
+    schema = schema_for_flat(dimensions, [], extra_fields=[
+        bigquery.SchemaField("cohort_period", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("cohort_maturity", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("ad_spend_mode", "STRING", mode="REQUIRED"),
+    ])
+    # Insert event metadata before metrics if event cohort table.
+    if event:
+        # rebuild before audit columns for readability, but BigQuery doesn't care.
+        schema = [f for f in schema if f.name not in ("_ingested_at", "_run_id")]
+        schema += [
+            bigquery.SchemaField("event_slug", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("event_name", "STRING"),
+            bigquery.SchemaField("event_short_name", "STRING"),
+        ]
+    for x in fields:
+        schema.append(bigquery.SchemaField(x, "FLOAT"))
+    if event:
+        schema += [
+            bigquery.SchemaField("_ingested_at", "TIMESTAMP", mode="REQUIRED"),
+            bigquery.SchemaField("_run_id", "STRING", mode="REQUIRED"),
+        ]
+    return dedupe_schema(schema)
+
+
+def ensure_table(client: bigquery.Client, table_name: str, schema: list[bigquery.SchemaField], cluster: list[str]) -> str:
+    ensure_dataset(client)
+    ref = f"{GCP_PROJECT}.{BQ_DATASET}.{table_name}"
+    names = {f.name for f in schema}
+    cluster_fields = [x for x in cluster if x in names][:4]
+    try:
+        table = client.get_table(ref)
+    except gexc.NotFound:
+        table = bigquery.Table(ref, schema=schema)
+        table.time_partitioning = bigquery.TimePartitioning(type_=bigquery.TimePartitioningType.DAY, field="date")
+        if cluster_fields:
+            table.clustering_fields = cluster_fields
+        client.create_table(table)
+        log.info("Created %s", ref)
+        return ref
+
+    have = {f.name: f for f in table.schema}
+    new_fields = []
+    for f in schema:
+        if f.name not in have:
+            new_fields.append(bigquery.SchemaField(f.name, f.field_type, mode="NULLABLE", description=f.description))
+    if new_fields:
+        table.schema = list(table.schema) + new_fields
+        client.update_table(table, ["schema"])
+        log.info("%s schema +%d fields", table_name, len(new_fields))
+    return ref
+
+
+def parse_flat_rows(raw_rows: list[dict[str, Any]], dimensions: list[str], metrics: list[str], *, extras: dict[str, Any] | None = None):
+    now = datetime.now(timezone.utc).isoformat()
+    out: list[dict[str, Any]] = []
+    for raw in raw_rows:
+        day = str(raw.get("day") or raw.get("date") or "")[:10]
+        tok = str(raw.get("app_token") or "").strip()
+        if not day or not tok:
+            continue
+        row: dict[str, Any] = {"date": day, "app_token": tok}
+        for d in dimensions:
+            if d in ("day", "app_token"):
+                continue
+            row[d] = _clean(raw.get(d))
+        if "store_id" in dimensions:
+            ap, ai, az = derive_store_keys(raw.get("store_id"), raw.get("store_type"), raw.get("os_name"))
+            row["android_package"], row["apple_id"], row["amazon_asin"] = ap, ai, az
+        for m in metrics:
+            if m in raw:
+                row[m] = _num(raw.get(m))
+        if extras:
+            row.update(extras)
+        row["_ingested_at"] = now
+        row["_run_id"] = RUN_ID
+        out.append(row)
+    return out
+
+
+def safe_ident(name: str) -> str:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        raise ValueError(f"Unsafe BigQuery identifier: {name}")
+    return name
+
+
+def _rss_mb() -> int:
+    """🔴 v4.7: process ki ASAL RAM (MB). 0 = na parh sake."""
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return 0
+
+
+def _rss_hint() -> str:
+    """🔴 v3.7: process ki asal RAM. GitHub runner OOM par sirf
+    "The operation was canceled." likhta hai — koi wajah nahi deta. Ye line
+    log mein memory ka safar dikhati hai, taake agli baar andaza na lagana pare.
+    Koi extra package nahi — /proc/self/status Linux par hamesha hota hai."""
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    mb = int(line.split()[1]) // 1024
+                    return f" · RAM {mb} MB"
+    except Exception:
+        pass
+    return ""
+
+
+class StagingWriter:
+    """🔑 v3.5: rows ko memory mein jama karne ke bajaye staging table mein
+    batch-by-batch bhejta hai. Memory hamesha ek batch jitni.
+
+    add(rows)  — buffer mein daalo; buffer bhar jaye to flush
+    flush()    — buffer BigQuery staging mein (WRITE_APPEND)
+    total      — kitne rows ja chuke
+    """
+
+    def __init__(self, client: bigquery.Client, table_name: str,
+                 schema: list[bigquery.SchemaField]):
+        self.client = client
+        self.schema = schema
+        run_suffix = re.sub(r"[^A-Za-z0-9_]", "_", RUN_ID)[-80:]
+        self.name = f"{table_name}__stg_{run_suffix}"
+        self.ref = f"{GCP_PROJECT}.{BQ_DATASET}.{self.name}"
+        self._buf: list[dict[str, Any]] = []
+        self.total = 0
+        self._created = False
+        self._row_bytes: int | None = None
+        self._flush_at = STREAM_FLUSH_ROWS
+
+    def _create(self):
+        if self._created:
+            return
+        try:
+            self.client.create_table(bigquery.Table(self.ref, schema=self.schema), exists_ok=True)
+        except Exception:
+            pass
+        self._created = True
+
+    def add(self, rows: list[dict[str, Any]]):
+        """🔑 v3.6: row-count AUR bytes — dono par flush.
+
+        Sirf row count par bharosa khatarnak hai: campaign ke ek row mein 173
+        fields hain, `app` ke row mein ~20. 50,000 rows ka matlab campaign par
+        ~700 MB aur app par ~60 MB — bilkul alag. Ab pehla batch naap kar asal
+        row size maloom karte hain aur usi hisaab se flush karte hain.
+        """
+        if not rows:
+            return
+        self._buf.extend(rows)
+
+        # 🔴 v4.6: ek `add()` mein 3.5 LAKH rows aa sakte hain (cohort par asal
+        #    mein aaye — ≈818 MB ek batch). Flush `add` ke BAAD chalta tha, is
+        #    liye buffer pehle utna bara ho jata tha. Ab jab tak buffer had se
+        #    ooper hai, baar baar flush karo — tukron mein.
+        if self._row_bytes is None and len(self._buf) >= 200:
+            # ek baar naap lo — 200 rows ka namoona
+            try:
+                sample = json.dumps(self._buf[:200], default=str)
+                self._row_bytes = max(200, len(sample) // 200)
+                cap = max(2000, STREAM_MAX_BYTES // self._row_bytes)
+                self._flush_at = min(STREAM_FLUSH_ROWS, cap)
+                log.info("   → streaming: ~%d bytes/row, flush har %d rows",
+                         self._row_bytes, self._flush_at)
+            except Exception:
+                self._row_bytes = 0
+                self._flush_at = STREAM_FLUSH_ROWS
+
+        while len(self._buf) >= self._flush_at:
+            self.flush()
+
+        # 🔴 v4.7: ASAL RAM check — andaze par bharosa nahi.
+        if self._buf and _rss_mb() >= STREAM_MAX_RSS_MB:
+            log.warning("   ⚠️  RAM %d MB ≥ %d MB — foran flush (%d rows)",
+                        _rss_mb(), STREAM_MAX_RSS_MB, len(self._buf))
+            self.flush()
+            import gc; gc.collect()
+
+    def flush(self):
+        if not self._buf:
+            return
+        self._create()
+        # 🔴 v4.6: ek baar mein sirf `_flush_at` rows lo — poora buffer nahi.
+        #    Warna 350k rows ka JSON ek saath banta hai (≈800 MB spike).
+        take = self._flush_at if len(self._buf) > self._flush_at else len(self._buf)
+        batch, self._buf = self._buf[:take], self._buf[take:]
+        job = self.client.load_table_from_json(
+            batch, self.ref,
+            job_config=bigquery.LoadJobConfig(
+                schema=self.schema,
+                write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+                source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+            ),
+        )
+        job.result()
+        if job.output_rows != len(batch):
+            raise RuntimeError(f"staging row mismatch expected={len(batch)} loaded={job.output_rows}")
+        self.total += len(batch)
+        # 🔴 v3.7: ASAL memory log karo. Ab tak hum andaza laga rahe the ke OOM
+        #    hai; ye line agli run mein saaf bata degi kitni RAM lagi.
+        log.info("   → staging: +%d rows (kul %d)%s", len(batch), self.total, _rss_hint())
+
+    def drop(self):
+        if self._created:
+            try:
+                self.client.delete_table(self.ref, not_found_ok=True)
+            except Exception:
+                pass
+
+
+def atomic_replace_window(client: bigquery.Client, table_name: str, rows: list[dict[str, Any]],
+                          schema: list[bigquery.SchemaField], ok_tokens: set[str], start: date, end: date,
+                          *, cluster: list[str], extra_delete_sql: str = "", extra_query_params: list[Any] | None = None,
+                          writer: "StagingWriter | None" = None):
+    """Load staging first, then DELETE+INSERT inside one BigQuery transaction.
+
+    Empty successful result intentionally deletes stale data for the successful apps/window,
+    MAGAR sirf tab jab us window mein pehle se kuch na ho (v3.3 khali-jawab guard).
+    """
+    if not ok_tokens:
+        # 🔧 v3.5: pehle yahan se seedha return tha — table BANTI HI NAHI thi.
+        #    (cohort_daily_performance isi wajah se kabhi nahi bani.)
+        try:
+            ensure_table(client, table_name, schema, cluster)
+            log.warning("⚠️  %s: khali table bana di (koi kaamyab app token nahi)", table_name)
+        except Exception as exc:
+            log.warning("⚠️  %s: khali table bhi nahi ban saki: %s", table_name, exc)
+        if writer is not None:
+            writer.drop()
+        record_failure(table_name,
+                       "koi kaamyab app token nahi — har chunk fail hua YA koi metric "
+                       "qubool nahi hui. Upar 'Metrics supported 0/N' dekhein.")
+        return
+    target = ensure_table(client, table_name, schema, cluster)
+
+    # ── 🛡️ v3.3 KHALI-JAWAB GUARD ────────────────────────────────────────────
+    #  Sirf tab chalta hai jab: 0 rows aaye AUR schema mein `date` column ho.
+    #  Query partition-pruned COUNT hai (tables `date` par partitioned hain),
+    #  is liye sasti hai. Koi bhi gharbar ho to FAIL karte hain, wipe nahi.
+    # 🔴 v4.5 BUG FIX (2026-09-25):
+    #    `writer.total` SIRF flush ho chuke rows ginta hai. Buffer 50,000 rows
+    #    par flush hota hai — chhoti report (app = ~8,956 rows / 14 din) kabhi
+    #    us had tak pohanchti hi nahi, is liye `total` 0 rehta tha.
+    #    Natija: neeche wala khali-jawab guard samajhta tha "Adjust ne 0 rows
+    #    diye" aur report FAIL kar deta tha — jabke 8,956 rows buffer mein
+    #    maujood the. Live saboot (run #97):
+    #        → streaming: ~2059 bytes/row      ← rows aa rahe the
+    #        ❌ Adjust ne 0 rows diye magar 8956 rows hain
+    #    Isi liye spend/country/event (lakhon rows → flush ho jate) chal rahe
+    #    the aur app fail ho raha tha.
+    #    HAL: aakhri flush ab ginti se PEHLE — buffer khali, total sahi.
+    if writer is not None:
+        writer.flush()
+    row_count = writer.total if writer is not None else len(rows)
+
+    if (row_count == 0) and (not ALLOW_EMPTY_WIPE) and any(f.name == "date" for f in schema):
+        try:
+            existing = list(client.query(
+                f"SELECT COUNT(*) AS c FROM `{GCP_PROJECT}.{BQ_DATASET}.{table_name}` "
+                f"WHERE `date` BETWEEN @start AND @end",
+                job_config=bigquery.QueryJobConfig(query_parameters=[
+                    bigquery.ScalarQueryParameter("start", "DATE", start.isoformat()),
+                    bigquery.ScalarQueryParameter("end", "DATE", end.isoformat()),
+                ]),
+            ).result())[0].c
+        except Exception as exc:
+            record_failure(table_name,
+                           f"0 rows aaye aur maujooda data gin nahi sake ({exc}) — "
+                           f"ehtiyatan DELETE nahi kiya")
+            return
+        if existing > 0:
+            record_failure(
+                table_name,
+                f"Adjust ne 0 rows diye magar {start}..{end} mein pehle se {existing} rows hain — "
+                f"DELETE nahi kiya (khali-jawab guard). Jaan-boojh ke hatana ho to ALLOW_EMPTY_WIPE=1."
+            )
+            return
+        log.warning("⚠️  %s: 0 rows — magar window pehle se khali thi, aage barh rahe hain", table_name)
+
+    cols = [safe_ident(f.name) for f in schema]
+    if writer is not None:
+        # flush upar ho chuka (row_count se pehle) — yahan sirf naam chahiye.
+        staging_name, staging = writer.name, writer.ref
+    else:
+        run_suffix = re.sub(r"[^A-Za-z0-9_]", "_", RUN_ID)[-80:]
+        staging_name = f"{table_name}__stg_{run_suffix}"
+        staging = f"{GCP_PROJECT}.{BQ_DATASET}.{staging_name}"
+
+    try:
+        if writer is None:
+            st = bigquery.Table(staging, schema=schema)
+            client.create_table(st, exists_ok=False)
+        else:
+            client.create_table(bigquery.Table(staging, schema=schema), exists_ok=True)
+        if writer is None and rows:
+            job = client.load_table_from_json(
+                rows, staging,
+                job_config=bigquery.LoadJobConfig(
+                    schema=schema,
+                    write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+                    source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+                ),
+            )
+            job.result()
+            if job.output_rows != len(rows):
+                raise RuntimeError(f"staging row mismatch expected={len(rows)} loaded={job.output_rows}")
+
+        params: list[Any] = [
+            bigquery.ScalarQueryParameter("start", "DATE", start.isoformat()),
+            bigquery.ScalarQueryParameter("end", "DATE", end.isoformat()),
+            bigquery.ArrayQueryParameter("ok", "STRING", sorted(ok_tokens)),
+        ]
+        if extra_query_params:
+            params.extend(extra_query_params)
+        where_extra = f"\n AND {extra_delete_sql}" if extra_delete_sql else ""
+        col_sql = ", ".join(f"`{c}`" for c in cols)
+
+        # Backward-compatible insert: existing v1/v2 tables may have count metrics
+        # (for example installs/clicks/sessions) as INT64 while v3 staging keeps
+        # report metrics numeric/FLOAT64 for maximum Adjust API compatibility.
+        # BigQuery will not implicitly insert FLOAT64 into INT64.  Build the
+        # SELECT list from the *actual target schema* and explicitly cast only
+        # when the staging and target types differ.  This preserves historical
+        # tables without DROP/RECREATE or destructive schema migrations.
+        target_table = client.get_table(target)
+        target_types = {f.name: f.field_type.upper() for f in target_table.schema}
+        staging_types = {f.name: f.field_type.upper() for f in schema}
+
+        bq_cast_type = {
+            "INTEGER": "INT64", "INT64": "INT64",
+            "FLOAT": "FLOAT64", "FLOAT64": "FLOAT64",
+            "BOOLEAN": "BOOL", "BOOL": "BOOL",
+            "STRING": "STRING",
+            "DATE": "DATE", "DATETIME": "DATETIME",
+            "TIMESTAMP": "TIMESTAMP", "TIME": "TIME",
+            "NUMERIC": "NUMERIC", "BIGNUMERIC": "BIGNUMERIC",
+            "BYTES": "BYTES",
+        }
+
+        select_exprs = []
+        casted = []
+        for c in cols:
+            src_t = staging_types.get(c, "")
+            dst_t = target_types.get(c, src_t)
+            src_norm = bq_cast_type.get(src_t, src_t)
+            dst_norm = bq_cast_type.get(dst_t, dst_t)
+            if src_norm and dst_norm and src_norm != dst_norm:
+                select_exprs.append(f"CAST(`{c}` AS {dst_norm}) AS `{c}`")
+                casted.append(f"{c}:{src_norm}->{dst_norm}")
+            else:
+                select_exprs.append(f"`{c}`")
+
+        if casted:
+            log.info("  [%s] schema compatibility casts: %s", table_name, ", ".join(casted[:25]))
+            if len(casted) > 25:
+                log.info("  [%s] ... plus %d more casts", table_name, len(casted) - 25)
+
+        select_sql = ", ".join(select_exprs)
+        sql = f"""
+        BEGIN TRANSACTION;
+        DELETE FROM `{target}`
+         WHERE date BETWEEN @start AND @end
+           AND app_token IN UNNEST(@ok){where_extra};
+        INSERT INTO `{target}` ({col_sql})
+        SELECT {select_sql} FROM `{staging}`;
+        COMMIT TRANSACTION;
+        """
+        client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
+
+        # 🛡️ v3.6 POST-SWAP VERIFY: transaction ke baad BigQuery se ginti wapas
+        #    parho. Agar target mein utne rows nahi jitne staging mein the, to
+        #    kuch gir gaya — chup-chaap qubool mat karo.
+        try:
+            landed = list(client.query(
+                f"SELECT COUNT(*) AS c FROM `{target}` "
+                f"WHERE date BETWEEN @start AND @end AND app_token IN UNNEST(@ok)" + where_extra,
+                job_config=bigquery.QueryJobConfig(query_parameters=params),
+            ).result())[0].c
+            if landed != row_count:
+                record_failure(
+                    f"post_verify[{table_name}]",
+                    f"swap ke baad ginti nahi mili: bheje {row_count}, mile {landed} "
+                    f"({start}..{end}, {len(ok_tokens)} apps)")
+            else:
+                log.info("   🛡️ post-verify: %d rows target mein confirm", landed)
+        except Exception as exc:
+            log.warning("post-verify nahi chal saka (%s) — swap khud kaamyab tha", exc)
+        # 🔧 v3.6 BUG FIX: streaming mode mein `rows` khali list hoti hai
+        #    (data staging mein gaya tha), is liye `len(rows)` hamesha 0 likhta
+        #    tha — log jhoot bolta tha "with 0 rows" jabke lakhon rows gaye.
+        log.info("✅ %s: replaced %s..%s for %d apps with %d rows",
+                 table_name, start, end, len(ok_tokens), row_count)
+    except Exception as exc:
+        record_failure(f"atomic_replace[{table_name}]", exc)
+    finally:
+        try:
+            client.delete_table(staging, not_found_ok=True)
+        except Exception as exc:
+            log.warning("Could not delete staging %s: %s", staging, exc)
+
+# -----------------------------------------------------------------------------
+# Catalog BigQuery tables
+# -----------------------------------------------------------------------------
+def load_simple_snapshot(client: bigquery.Client, table_name: str, rows: list[dict[str, Any]], schema: list[bigquery.SchemaField]):
+    ensure_dataset(client)
+    ref = f"{GCP_PROJECT}.{BQ_DATASET}.{table_name}"
+    try:
+        client.get_table(ref)
+    except gexc.NotFound:
+        client.create_table(bigquery.Table(ref, schema=schema))
+    if rows:
+        client.load_table_from_json(rows, ref, job_config=bigquery.LoadJobConfig(
+            schema=schema, write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE)).result()
+    else:
+        client.query(f"TRUNCATE TABLE `{ref}`").result()
+
+
+def persist_catalogs(client: bigquery.Client, filters: dict[str, list[dict[str, Any]]], events: list[dict[str, Any]], periods: list[str]):
+    if DRY_RUN:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    filter_rows = []
+    for kind, items in filters.items():
+        for item in items:
+            filter_rows.append({
+                "filter_type": kind,
+                "id": _clean(item.get("id")),
+                "name": _clean(item.get("name")),
+                "short_name": _clean(item.get("short_name")),
+                "section": _clean(item.get("section")),
+                "formatting": _clean(item.get("formatting")),
+                "description": _clean(item.get("description")),
+                "_ingested_at": now,
+            })
+    load_simple_snapshot(client, "adjust_filter_catalog", filter_rows, [
+        bigquery.SchemaField("filter_type", "STRING"), bigquery.SchemaField("id", "STRING"),
+        bigquery.SchemaField("name", "STRING"), bigquery.SchemaField("short_name", "STRING"),
+        bigquery.SchemaField("section", "STRING"), bigquery.SchemaField("formatting", "STRING"),
+        bigquery.SchemaField("description", "STRING"), bigquery.SchemaField("_ingested_at", "TIMESTAMP"),
+    ])
+
+    event_rows = []
+    for e in events:
+        event_rows.append({
+            "event_slug": _clean(e.get("id")), "event_name": _clean(e.get("name")),
+            "event_short_name": _clean(e.get("short_name")), "section": _clean(e.get("section")),
+            "formatting": _clean(e.get("formatting")), "is_skad_event": bool(e.get("is_skad_event")),
+            "app_tokens_json": json.dumps(e.get("app_token") or []),
+            "event_tokens_json": json.dumps(e.get("tokens") or []),
+            "mapping_json": json.dumps(e.get("app_token_x_event_tokens_mapping") or {}),
+            "_ingested_at": now,
+        })
+    load_simple_snapshot(client, "adjust_event_catalog", event_rows, [
+        bigquery.SchemaField("event_slug", "STRING"), bigquery.SchemaField("event_name", "STRING"),
+        bigquery.SchemaField("event_short_name", "STRING"), bigquery.SchemaField("section", "STRING"),
+        bigquery.SchemaField("formatting", "STRING"), bigquery.SchemaField("is_skad_event", "BOOLEAN"),
+        bigquery.SchemaField("app_tokens_json", "STRING"), bigquery.SchemaField("event_tokens_json", "STRING"),
+        bigquery.SchemaField("mapping_json", "STRING"), bigquery.SchemaField("_ingested_at", "TIMESTAMP"),
+    ])
+
+    period_rows = [{"cohort_period": p, "unit": p[0], "number": int(p[1:]), "_ingested_at": now} for p in periods]
+    load_simple_snapshot(client, "adjust_cohort_period_catalog", period_rows, [
+        bigquery.SchemaField("cohort_period", "STRING"), bigquery.SchemaField("unit", "STRING"),
+        bigquery.SchemaField("number", "INTEGER"), bigquery.SchemaField("_ingested_at", "TIMESTAMP"),
+    ])
+
+# -----------------------------------------------------------------------------
+# Parallel fetch helpers
+# -----------------------------------------------------------------------------
+def fetch_app_chunks_parallel(tokens: list[str], start: date, end: date, dimensions: list[str],
+                              metrics: list[str], label_prefix: str, *, ad_spend_mode: str,
+                              cohort_maturity: str | None = None):
+    """YIELDS (chunk_index, chunk, rows) — pehle poori list return karta tha.
+
+    🔑 v3.5: generator ban gaya. Pehle saarey chunks ka data ek saath memory
+    mein hota tha (OOM ki bari wajah). Ab caller har chunk ko aate hi staging
+    mein bhej deta hai.
+
+    🔑 DATE_CHUNK_DAYS > 0 ho to har app-chunk ka window bhi chhote tukron
+    mein toota jata hai, aur har tukra ALAG yield hota hai (merge nahi).
+    """
+    chunks = list(chunked(tokens, CHUNK_SIZE))
+    if not chunks:
+        return
+
+    def date_windows(a: date, b: date):
+        if DATE_CHUNK_DAYS <= 0:
+            return [(a, b)]
+        out, cur = [], a
+        while cur <= b:
+            nxt = min(cur + timedelta(days=DATE_CHUNK_DAYS - 1), b)
+            out.append((cur, nxt))
+            cur = nxt + timedelta(days=1)
+        return out
+
+    windows = date_windows(start, end)
+    if len(windows) > 1:
+        log.info("%s: window %s..%s → %d date-chunks (%d din each)",
+                 label_prefix, start, end, len(windows), DATE_CHUNK_DAYS)
+
+    def do_one(ci: int, app_chunk: list[str], wi: int, ws: date, we: date):
+        """🔑 v3.6: KHUD-MUTABIQ SPLIT.
+
+        CHUNK_SIZE / window kitna bara ho — pehle se maloom nahi. Bara chunk
+        tez hai (kam requests) magar Adjust par timeout kar sakta hai. Pehle
+        aisi soorat mein poora chunk fail ho jata tha.
+        Ab: fail hone par chunk ko AADHA kar ke dobara koshish karte hain,
+        aur agar phir bhi na chale to window ko aadha. 3 darje tak.
+        Is se bara CHUNK_SIZE (50) mehfooz ho jata hai — na chale to khud tootega.
+        """
+        lbl = f"{label_prefix}:chunk{ci}" if len(windows) == 1 else f"{label_prefix}:chunk{ci}:w{wi}"
+
+        def attempt(apps: list[str], a: date, b: date, depth: int, tag: str):
+            rows = fetch_merged(
+                apps, a, b, dimensions, metrics, tag,
+                ad_spend_mode=ad_spend_mode, cohort_maturity=cohort_maturity,
+            )
+            if rows is not None or depth >= 3:
+                return rows
+            # ── pehle apps aadhe ──
+            if len(apps) > 1:
+                mid = len(apps) // 2
+                log.warning("✂️  %s fail — apps aadhe (%d → %d+%d), dobara",
+                            tag, len(apps), mid, len(apps) - mid)
+                left = attempt(apps[:mid], a, b, depth + 1, f"{tag}.a")
+                right = attempt(apps[mid:], a, b, depth + 1, f"{tag}.b")
+                if left is None or right is None:
+                    return None
+                return left + right
+            # ── ek hi app bacha: window aadhi ──
+            span = (b - a).days
+            if span >= 1:
+                mid_d = a + timedelta(days=span // 2)
+                log.warning("✂️  %s fail — window aadhi (%s..%s), dobara", tag, a, b)
+                left = attempt(apps, a, mid_d, depth + 1, f"{tag}.w1")
+                right = attempt(apps, mid_d + timedelta(days=1), b, depth + 1, f"{tag}.w2")
+                if left is None or right is None:
+                    return None
+                return left + right
+            return None
+
+        return ci, app_chunk, attempt(app_chunk, ws, we, 0, lbl)
+
+    tasks = [(ci, ac, wi, ws, we)
+             for ci, ac in enumerate(chunks, 1)
+             for wi, (ws, we) in enumerate(windows, 1)]
+
+    # 🔴 v4.6 — BOUNDED IN-FLIGHT (asal memory leak ka hal)
+    #    PEHLE: `futures = [pool.submit(do_one, *t) for t in tasks]` — SAAREY
+    #    tasks ek saath submit hote the (cohort par 150+). Har MUKAMMAL future
+    #    apna rows-list THAAM kar rakhta hai jab tak consumer us tak na pohanche.
+    #    Workers aage bhagte rehte the, is liye darjanon bare nataij ek saath
+    #    memory mein rehte the aur RAM kabhi neeche nahi aati thi.
+    #    Live saboot (run #98, cohort):
+    #        +350750 rows · RAM  8,075 MB
+    #        +371930 rows · RAM 10,008 MB
+    #        +352130 rows · RAM 11,249 MB  →  "The operation was canceled."
+    #    AB: sirf `limit` futures ek waqt mein. Ek khatam ho, uska data yield ho
+    #    kar FREE ho, tab agla submit hota hai. Memory bounded reh-ti hai.
+    limit = worker_count(len(tasks))
+    # 🔴 v4.7: in-flight = limit (pehle limit×2). Har mukammal future apna
+    #    parsed dict-list thaame rakhta hai — bhaari report par wo GB mein hota
+    #    hai. Kam in-flight = kam RAM. Thora sust, magar zinda.
+    inflight = limit
+    with ThreadPoolExecutor(max_workers=limit, thread_name_prefix="adjust-chunk") as pool:
+        it = iter(tasks)
+        pending = {pool.submit(do_one, *t) for t in itertools.islice(it, inflight)}
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for fut in done:
+                try:
+                    res = fut.result()
+                except Exception as exc:
+                    log.exception("%s worker crashed: %s", label_prefix, exc)
+                    res = (-1, [], None)
+                yield res
+                del res            # 🔴 v4.7: reference foran chhodo — GC kar sake
+                # ek nikla, ek daalo — in-flight ginti wahi rehti hai
+                nxt = next(it, None)
+                if nxt is not None:
+                    pending.add(pool.submit(do_one, *nxt))
+
+# -----------------------------------------------------------------------------
+# Base reports
+# -----------------------------------------------------------------------------
+def run_flat_report(client: bigquery.Client | None, report_key: str, tokens: list[str], start: date, end: date,
+                    filters: dict[str, list[dict[str, Any]]], sample_start: date, sample_end: date):
+    cfg = REPORTS[report_key]
+    dims = choose_dimensions(cfg["dimensions"], filters)
+    dims = negotiate_dimensions(dims, tokens[0], sample_start, sample_end)
+    candidates = SPEND_METRICS if report_key == "spend" else BASE_METRICS
+    modes = SPEND_RECON_MODES if report_key == "spend" else [AD_SPEND_MODE]
+
+    ok_tokens: set[str] = set()
+
+    # ── 🔑 v3.5 PASS 1: sirf negotiation, koi fetch nahi ──
+    #    Schema pehle chahiye taake staging bana kar streaming shuru ho sake.
+    mode_metrics: dict[str, list[str]] = {}
+    union_metrics: list[str] = []
+    for mode in modes:
+        supported = negotiate_metrics(dims, candidates, tokens[0], sample_start, sample_end,
+                                      ad_spend_mode=mode, cohort_maturity=None)
+        mode_metrics[mode] = supported
+        union_metrics.extend(supported)
+
+    union_metrics = list(dict.fromkeys(union_metrics))
+    schema = schema_for_flat(dims, union_metrics, extra_fields=[
+        bigquery.SchemaField("ad_spend_mode", "STRING", mode="REQUIRED")
+    ])
+
+    # ── 🔑 v3.5 PASS 2: fetch + SEEDHA STAGING mein ──
+    #    Pehle saarey rows `all_rows` mein jama hote the. campaign par
+    #    (23 dims × 150 metrics = 173 fields/row) runner ki 7 GB RAM khatam ho
+    #    jati thi, Python OOM-kill hota tha, aur GitHub "The operation was
+    #    canceled." likhta tha. Ab memory ek batch (50k rows) jitni hoti hai.
+    writer = StagingWriter(client, cfg["table"], schema) if (client is not None and not DRY_RUN) else None
+    all_rows: list[dict[str, Any]] = []      # sirf DRY_RUN ke liye
+
+    for mode in modes:
+        supported = mode_metrics[mode]
+        if not supported:
+            record_failure(f"{report_key}:{mode}",
+                           "koi metric qubool nahi hui (upar 'KOI METRIC QUBOOL NAHI HUI' dekhein)")
+            continue
+        for ci, app_chunk, raw in fetch_app_chunks_parallel(
+                tokens, start, end, dims, supported, f"{report_key}:{mode}",
+                ad_spend_mode=mode):
+            if raw is None:
+                record_failure(f"{report_key}:{mode}:chunk{ci}", "fetch failed")
+                continue
+            parsed = parse_flat_rows(raw, dims, supported, extras={"ad_spend_mode": mode})
+            if writer is not None:
+                writer.add(parsed)
+            else:
+                all_rows.extend(parsed)
+            ok_tokens.update(app_chunk)
+            del parsed, raw                  # memory foran free
+    # Rows fetched under modes with fewer metrics simply leave missing nullable fields.
+    if DRY_RUN:
+        log.info("[DRY] %s rows=%d metrics=%d sample=%s", cfg["table"], len(all_rows), len(union_metrics), json.dumps(all_rows[:1], default=str)[:800])
+        return
+    assert client is not None
+    if report_key == "spend":
+        # Replace all configured modes in one transaction, so no extra filter needed.
+        atomic_replace_window(client, cfg["table"], all_rows, schema, ok_tokens, start, end,
+                              cluster=cfg["cluster"] + ["ad_spend_mode"], writer=writer)
+    else:
+        atomic_replace_window(client, cfg["table"], all_rows, schema, ok_tokens, start, end,
+                              cluster=cfg["cluster"] + ["ad_spend_mode"], writer=writer,
+                              extra_delete_sql="ad_spend_mode = @mode",
+                              extra_query_params=[bigquery.ScalarQueryParameter("mode", "STRING", AD_SPEND_MODE)])
+
+# -----------------------------------------------------------------------------
+# Cohort report (normalized LONG)
+# -----------------------------------------------------------------------------
+def build_cohort_metric_map(periods: list[str]):
+    slug_to_info: dict[str, tuple[str, str]] = {}
+    for p in periods:
+        for field, tmpl in COHORT_FAMILIES.items():
+            slug = tmpl.format(p=p)
+            slug_to_info[slug] = (p, field)
+    return slug_to_info
+
+
+def normalize_cohort_rows(raw_rows: list[dict[str, Any]], dimensions: list[str], supported_metrics: list[str],
+                          metric_map: dict[str, tuple[str, str]], maturity: str):
+    now = datetime.now(timezone.utc).isoformat()
+    out: list[dict[str, Any]] = []
+    supported_set = set(supported_metrics)
+    by_period: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for slug, (p, field) in metric_map.items():
+        if slug in supported_set:
+            by_period[p].append((slug, field))
+
+    for raw in raw_rows:
+        day = str(raw.get("day") or raw.get("date") or "")[:10]
+        tok = str(raw.get("app_token") or "").strip()
+        if not day or not tok:
+            continue
+        base = {"date": day, "app_token": tok}
+        for d in dimensions:
+            if d not in ("day", "app_token"):
+                base[d] = _clean(raw.get(d))
+        for p, mappings in by_period.items():
+            # Only create the period row if the API actually returned at least one metric key.
+            if not any(slug in raw for slug, _ in mappings):
+                continue
+            rec = dict(base)
+            rec["cohort_period"] = p
+            rec["cohort_maturity"] = maturity
+            rec["ad_spend_mode"] = AD_SPEND_MODE
+            for slug, field in mappings:
+                if slug in raw:
+                    rec[field] = _num(raw.get(slug))
+            rec["_ingested_at"] = now
+            rec["_run_id"] = RUN_ID
+            out.append(rec)
+    return out
+
+
+def run_cohort_report(client: bigquery.Client | None, tokens: list[str], start: date, end: date,
+                      filters: dict[str, list[dict[str, Any]]], periods: list[str], sample_start: date, sample_end: date):
+    dims = choose_dimensions(COHORT_DIMENSIONS, filters)
+    dims = negotiate_dimensions(dims, tokens[0], sample_start, sample_end)
+    fields = list(COHORT_FAMILIES.keys())
+    schema = cohort_schema(dims, fields)
+    ok_tokens: set[str] = set()
+
+    # 🔑 v3.5 PERIOD BATCHING: 66 metric families × 121 periods = ~8,000 metrics
+    #    ek hi request mein — Adjust ki negotiation itna bara payload qubool
+    #    nahi karti thi ("Metrics supported 0/N"), ok_tokens khali reh jate the,
+    #    aur cohort_daily_performance table KABHI BANI HI NAHI.
+    #    Ab 10-period batches: 660 metrics per request. Rows staging mein jate
+    #    rehte hain, memory nahi bharti. DATA POORA — kuch kaata nahi.
+    period_batches = [periods[i:i + COHORT_PERIOD_BATCH]
+                      for i in range(0, len(periods), COHORT_PERIOD_BATCH)]
+    log.info("Cohort: %d periods → %d batches (×%d) × %d maturities",
+             len(periods), len(period_batches), COHORT_PERIOD_BATCH, len(COHORT_MATURITIES))
+
+    writer = StagingWriter(client, "cohort_daily_performance", schema) if (client is not None and not DRY_RUN) else None
+    all_rows: list[dict[str, Any]] = []      # sirf DRY_RUN ke liye
+    any_supported = False
+
+    for maturity in COHORT_MATURITIES:
+        for bi, pbatch in enumerate(period_batches, 1):
+            metric_map = build_cohort_metric_map(pbatch)
+            candidates = list(metric_map.keys())
+            supported = negotiate_metrics(dims, candidates, tokens[0], sample_start, sample_end,
+                                          ad_spend_mode=AD_SPEND_MODE, cohort_maturity=maturity)
+            if not supported:
+                log.warning("cohort[%s] batch %d/%d (%s): koi metric qubool nahi hui — skip",
+                            maturity, bi, len(period_batches), ",".join(pbatch))
+                continue
+            any_supported = True
+            log.info("cohort[%s] batch %d/%d — periods=%s · metrics=%d/%d",
+                     maturity, bi, len(period_batches), ",".join(pbatch),
+                     len(supported), len(candidates))
+            for ci, app_chunk, raw in fetch_app_chunks_parallel(
+                    tokens, start, end, dims, supported, f"cohort:{maturity}:b{bi}",
+                    ad_spend_mode=AD_SPEND_MODE, cohort_maturity=maturity):
+                if raw is None:
+                    record_failure(f"cohort:{maturity}:b{bi}:chunk{ci}", "fetch failed")
+                    continue
+                parsed = normalize_cohort_rows(raw, dims, supported, metric_map, maturity)
+                if writer is not None:
+                    writer.add(parsed)
+                else:
+                    all_rows.extend(parsed)
+                ok_tokens.update(app_chunk)
+                del parsed, raw
+
+    if not any_supported:
+        record_failure("cohort",
+                       f"kisi bhi period-batch par koi metric qubool nahi hui "
+                       f"({len(period_batches)} batches × {len(COHORT_MATURITIES)} maturities). "
+                       f"Upar 'KOI METRIC QUBOOL NAHI HUI' wali line dekhein.")
+
+    if DRY_RUN:
+        log.info("[DRY] cohort rows=%d periods=%d sample=%s", len(all_rows), len(periods), json.dumps(all_rows[:1], default=str)[:900])
+        return
+    assert client is not None
+    atomic_replace_window(client, "cohort_daily_performance", all_rows, schema, ok_tokens, start, end,
+                          cluster=["app_token", "partner", "campaign_id_network", "cohort_period"],
+                          writer=writer)
+
+# -----------------------------------------------------------------------------
+# Event reports
+# -----------------------------------------------------------------------------
+def event_applies_to_token(event: dict[str, Any], token: str) -> bool:
+    app_tokens = event.get("app_token") or []
+    if isinstance(app_tokens, list) and app_tokens:
+        return token in app_tokens
+    mapping = event.get("app_token_x_event_tokens_mapping") or {}
+    if isinstance(mapping, dict) and mapping:
+        return token in mapping
+    return True
+
+
+def run_event_daily(client: bigquery.Client | None, tokens: list[str], start: date, end: date,
+                    filters: dict[str, list[dict[str, Any]]], events: list[dict[str, Any]], sample_start: date, sample_end: date):
+    dims = choose_dimensions(EVENT_DIMENSIONS, filters)
+    dims = negotiate_dimensions(dims, tokens[0], sample_start, sample_end)
+    schema = schema_for_flat(dims, ["event_count"], extra_fields=[
+        bigquery.SchemaField("event_slug", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("event_name", "STRING"),
+        bigquery.SchemaField("event_short_name", "STRING"),
+        bigquery.SchemaField("ad_spend_mode", "STRING", mode="REQUIRED"),
+    ])
+    all_rows: list[dict[str, Any]] = []
+    ok_tokens: set[str] = set()
+    now = datetime.now(timezone.utc).isoformat()
+
+    def prepare_event(ev: dict[str, Any]):
+        slug = _clean(ev.get("id"))
+        if not slug:
+            return None
+        metric = f"{slug}_events"
+        eligible_tokens = [t for t in tokens if event_applies_to_token(ev, t)]
+        if not eligible_tokens:
+            return None
+        supported = negotiate_metrics(
+            dims, [metric], eligible_tokens[0], sample_start, sample_end,
+            ad_spend_mode=AD_SPEND_MODE, cohort_maturity=None,
+        )
+        if not supported:
+            return None
+        return ev, slug, metric, eligible_tokens
+
+    prepared = []
+    with ThreadPoolExecutor(max_workers=worker_count(len(events)), thread_name_prefix="adjust-event-probe") as pool:
+        futures = [pool.submit(prepare_event, ev) for ev in events]
+        for fut in as_completed(futures):
+            try:
+                item = fut.result()
+                if item is not None:
+                    prepared.append(item)
+            except Exception as exc:
+                log.warning("Event preparation failed: %s", exc)
+
+    jobs = []
+    for ev, slug, metric, eligible_tokens in prepared:
+        for ci, app_chunk in enumerate(chunked(eligible_tokens, CHUNK_SIZE), 1):
+            jobs.append((ev, slug, metric, ci, app_chunk))
+
+    def fetch_event_job(job):
+        ev, slug, metric, ci, app_chunk = job
+        raw = fetch_merged(
+            app_chunk, start, end, dims, [metric],
+            f"event:{slug}:chunk{ci}", ad_spend_mode=AD_SPEND_MODE,
+        )
+        return ev, slug, metric, ci, app_chunk, raw
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=worker_count(len(jobs)), thread_name_prefix="adjust-event") as pool:
+        futures = [pool.submit(fetch_event_job, job) for job in jobs]
+        for fut in as_completed(futures):
+            completed += 1
+            try:
+                ev, slug, metric, ci, app_chunk, raw = fut.result()
+            except Exception as exc:
+                record_failure("event_worker", exc)
+                continue
+            if raw is None:
+                record_failure(f"event:{slug}:chunk{ci}", "fetch failed")
+                continue
+            for rr in raw:
+                day = str(rr.get("day") or rr.get("date") or "")[:10]
+                tok = str(rr.get("app_token") or "").strip()
+                if not day or not tok:
+                    continue
+                rec = {"date": day, "app_token": tok}
+                for d in dims:
+                    if d not in ("day", "app_token"):
+                        rec[d] = _clean(rr.get(d))
+                rec.update({
+                    "event_slug": slug,
+                    "event_name": _clean(ev.get("name")),
+                    "event_short_name": _clean(ev.get("short_name")),
+                    "event_count": _num(rr.get(metric)),
+                    "ad_spend_mode": AD_SPEND_MODE,
+                    "_ingested_at": now,
+                    "_run_id": RUN_ID,
+                })
+                all_rows.append(rec)
+            ok_tokens.update(app_chunk)
+            if completed % 50 == 0:
+                log.info("Event daily fetch progress %d/%d", completed, len(jobs))
+
+    if DRY_RUN:
+        log.info("[DRY] event_daily rows=%d events=%d", len(all_rows), len(events))
+        return
+    assert client is not None
+    atomic_replace_window(client, "event_daily_performance", all_rows, schema, ok_tokens, start, end,
+                          cluster=["app_token", "event_slug", "partner", "campaign_id_network"])
+
+
+def build_event_cohort_metric_map(event_slug: str, periods: list[str]):
+    m: dict[str, tuple[str, str]] = {}
+    for p in periods:
+        for field, tmpl in EVENT_COHORT_FAMILIES.items():
+            slug = tmpl.format(e=event_slug, p=p)
+            m[slug] = (p, field)
+    return m
+
+
+def run_event_cohort(client: bigquery.Client | None, tokens: list[str], start: date, end: date,
+                     filters: dict[str, list[dict[str, Any]]], events: list[dict[str, Any]], periods: list[str],
+                     sample_start: date, sample_end: date):
+    dims = choose_dimensions(EVENT_DIMENSIONS, filters)
+    dims = negotiate_dimensions(dims, tokens[0], sample_start, sample_end)
+    schema = cohort_schema(dims, list(EVENT_COHORT_FAMILIES.keys()), event=True)
+    all_rows: list[dict[str, Any]] = []
+    ok_tokens: set[str] = set()
+    now = datetime.now(timezone.utc).isoformat()
+
+    for maturity in COHORT_MATURITIES:
+        def prepare_event(ev: dict[str, Any]):
+            slug = _clean(ev.get("id"))
+            if not slug:
+                return None
+            eligible_tokens = [t for t in tokens if event_applies_to_token(ev, t)]
+            if not eligible_tokens:
+                return None
+            metric_map = build_event_cohort_metric_map(slug, periods)
+            candidates = list(metric_map.keys())
+            supported = negotiate_metrics(
+                dims, candidates, eligible_tokens[0], sample_start, sample_end,
+                ad_spend_mode=AD_SPEND_MODE, cohort_maturity=maturity,
+            )
+            if not supported:
+                return None
+            supported_set = set(supported)
+            by_period: dict[str, list[tuple[str, str]]] = defaultdict(list)
+            for metric_slug, (p, field) in metric_map.items():
+                if metric_slug in supported_set:
+                    by_period[p].append((metric_slug, field))
+            return ev, slug, eligible_tokens, supported, by_period
+
+        prepared = []
+        with ThreadPoolExecutor(max_workers=worker_count(len(events)), thread_name_prefix="adjust-eventcohort-probe") as pool:
+            futures = [pool.submit(prepare_event, ev) for ev in events]
+            for fut in as_completed(futures):
+                try:
+                    item = fut.result()
+                    if item is not None:
+                        prepared.append(item)
+                except Exception as exc:
+                    log.warning("Event cohort preparation [%s] failed: %s", maturity, exc)
+
+        jobs = []
+        for ev, slug, eligible_tokens, supported, by_period in prepared:
+            for ci, app_chunk in enumerate(chunked(eligible_tokens, CHUNK_SIZE), 1):
+                jobs.append((ev, slug, supported, by_period, ci, app_chunk))
+
+        def fetch_event_cohort_job(job):
+            ev, slug, supported, by_period, ci, app_chunk = job
+            raw = fetch_merged(
+                app_chunk, start, end, dims, supported,
+                f"event_cohort:{maturity}:{slug}:chunk{ci}",
+                ad_spend_mode=AD_SPEND_MODE, cohort_maturity=maturity,
+            )
+            return ev, slug, supported, by_period, ci, app_chunk, raw
+
+        completed = 0
+        with ThreadPoolExecutor(max_workers=worker_count(len(jobs)), thread_name_prefix="adjust-eventcohort") as pool:
+            futures = [pool.submit(fetch_event_cohort_job, job) for job in jobs]
+            for fut in as_completed(futures):
+                completed += 1
+                try:
+                    ev, slug, supported, by_period, ci, app_chunk, raw = fut.result()
+                except Exception as exc:
+                    record_failure(f"event_cohort:{maturity}:worker", exc)
+                    continue
+                if raw is None:
+                    record_failure(f"event_cohort:{maturity}:{slug}:chunk{ci}", "fetch failed")
+                    continue
+                for rr in raw:
+                    day = str(rr.get("day") or rr.get("date") or "")[:10]
+                    tok = str(rr.get("app_token") or "").strip()
+                    if not day or not tok:
+                        continue
+                    base = {"date": day, "app_token": tok}
+                    for d in dims:
+                        if d not in ("day", "app_token"):
+                            base[d] = _clean(rr.get(d))
+                    for p, mappings in by_period.items():
+                        if not any(ms in rr for ms, _ in mappings):
+                            continue
+                        rec = dict(base)
+                        rec.update({
+                            "cohort_period": p,
+                            "cohort_maturity": maturity,
+                            "ad_spend_mode": AD_SPEND_MODE,
+                            "event_slug": slug,
+                            "event_name": _clean(ev.get("name")),
+                            "event_short_name": _clean(ev.get("short_name")),
+                        })
+                        for ms, field in mappings:
+                            if ms in rr:
+                                rec[field] = _num(rr.get(ms))
+                        rec["_ingested_at"] = now
+                        rec["_run_id"] = RUN_ID
+                        all_rows.append(rec)
+                ok_tokens.update(app_chunk)
+                if completed % 50 == 0:
+                    log.info("Event cohort [%s] fetch progress %d/%d", maturity, completed, len(jobs))
+
+    if DRY_RUN:
+        log.info("[DRY] event_cohort rows=%d events=%d periods=%d", len(all_rows), len(events), len(periods))
+        return
+    assert client is not None
+    atomic_replace_window(client, "event_cohort_daily_performance", all_rows, schema, ok_tokens, start, end,
+                          cluster=["app_token", "event_slug", "cohort_period", "campaign_id_network"])
+
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+def main() -> None:
+    # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI hai — workflow ka "Verify loader"
+    #    step isi ko grep karta hai. Badlo to workflow bhi badalna parega.
+    # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI — workflow ka "Verify loader" grep.
+    # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI — workflow ka "Verify loader" grep.
+    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT | loader v4.7 (RSS-based flush)")
+    log.info("Workers: %d | max Adjust HTTP in-flight: %d | persist_catalogs=%s", MAX_WORKERS, MAX_HTTP_IN_FLIGHT, PERSIST_CATALOGS)
+    for name, value in (
+        ("ADJUST_API_TOKEN", ADJUST_API_TOKEN),
+        ("GCP_PROJECT", GCP_PROJECT),
+        ("GCP_CREDENTIALS_JSON", GCP_CREDENTIALS_JSON),
+    ):
+        if not value:
+            die(f"Required env {name} is empty")
+
+    if AD_SPEND_MODE not in {"adjust", "network", "mixed"}:
+        die("AD_SPEND_MODE must be adjust, network or mixed")
+    bad_maturity = [x for x in COHORT_MATURITIES if x not in {"mature", "immature"}]
+    if bad_maturity:
+        die(f"Invalid COHORT_MATURITIES: {bad_maturity}")
+
+    tokens = load_app_tokens()
+    filters = discover_filters()
+    need_events = any(r in ENABLED_REPORTS for r in ("event", "event_cohort")) or PERSIST_CATALOGS
+    events = discover_events(tokens) if need_events else []
+    all_periods = discovered_periods(filters)
+    cohort_periods = select_periods(COHORT_PERIODS_SETTING, all_periods)
+    event_periods = select_periods(EVENT_COHORT_PERIODS_SETTING, all_periods)
+
+    # Explicit backfill override, otherwise rolling windows.
+    end_override = parse_date_env(END_DATE_ENV, "END_DATE")
+    start_override = parse_date_env(START_DATE_ENV, "START_DATE")
+    end = end_override or (date.today() - timedelta(days=1))
+    flat_start = start_override or (end - timedelta(days=max(LOOKBACK_DAYS, 1) - 1))
+    cohort_start = start_override or (end - timedelta(days=max(COHORT_LOOKBACK_DAYS, 1) - 1))
+    if flat_start > end or cohort_start > end:
+        die("Start date is after end date")
+
+    # Probe the last few days. Recent data is more likely to exist.
+    sample_end = end
+    sample_start = max(date(2020, 1, 1), end - timedelta(days=6))
+
+    log.info("Flat window   : %s -> %s", flat_start, end)
+    log.info("Cohort window : %s -> %s", cohort_start, end)
+    log.info("Cohort periods: %d (%s..%s)", len(cohort_periods), cohort_periods[0], cohort_periods[-1])
+    log.info("Event periods : %d", len(event_periods))
+    log.info("Discovered events: %d", len(events))
+    log.info("Spend mode=%s | spend recon=%s | attribution_source=%s | currency=%s",
+             AD_SPEND_MODE, SPEND_RECON_MODES, ATTRIBUTION_SOURCE, REPORTING_CURRENCY)
+    log.info("Reports: %s", ",".join(ENABLED_REPORTS))
+
+    client = None if DRY_RUN else get_bq_client()
+    if client and PERSIST_CATALOGS:
+        persist_catalogs(client, filters, events, all_periods)
+
+    # Base reports
+    for key in ("app", "campaign", "country", "spend"):
+        if key in ENABLED_REPORTS:
+            log.info("=" * 88)
+            log.info("📊 %s", key)
+            run_flat_report(client, key, tokens, flat_start, end, filters, sample_start, sample_end)
+
+    if "cohort" in ENABLED_REPORTS:
+        log.info("=" * 88)
+        log.info("📊 cohort D0-D120 normalized")
+        run_cohort_report(client, tokens, cohort_start, end, filters, cohort_periods, sample_start, sample_end)
+
+    if "event" in ENABLED_REPORTS:
+        log.info("=" * 88)
+        log.info("📊 discovered custom events")
+        run_event_daily(client, tokens, flat_start, end, filters, events, sample_start, sample_end)
+
+    if "event_cohort" in ENABLED_REPORTS:
+        log.info("=" * 88)
+        log.info("📊 custom event cohort economics")
+        run_event_cohort(client, tokens, cohort_start, end, filters, events, event_periods, sample_start, sample_end)
+
+    if FAILURES:
+        log.error("=" * 88)
+        log.error("🔴 Completed with %d failures", len(FAILURES))
+        for f in FAILURES:
+            log.error("  • %s", f)
+        if any("khali-jawab guard" in f for f in FAILURES):
+            log.error("-" * 88)
+            log.error("💡 'khali-jawab guard' ka matlab: Adjust ne us report ke liye 0 rows diye,")
+            log.error("   is liye purana data URAYA NAHI gaya (yehi chahiye tha).")
+            log.error("   Asal wajah upar negotiation log mein dekhein —")
+            log.error("   aksar koi dimension/metric qubool nahi hoti, ya API sust hota hai.")
+        raise SystemExit(1)
+
+    log.info("✅ Complete. Run ID: %s", RUN_ID)
+
+
+if __name__ == "__main__":
+    main()
