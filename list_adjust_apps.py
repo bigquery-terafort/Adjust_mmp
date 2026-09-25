@@ -59,9 +59,28 @@ log = logging.getLogger("adjust_apps")
 ADJUST_ENDPOINT = "https://automate.adjust.com/reports-service/report"
 
 ADJUST_API_TOKEN = os.environ.get("ADJUST_API_TOKEN", "")
-LOOKBACK_DAYS    = int(os.environ.get("LOOKBACK_DAYS", "180"))
-REQUEST_TIMEOUT  = int(os.environ.get("REQUEST_TIMEOUT", "300"))
-MAX_RETRIES      = int(os.environ.get("MAX_RETRIES", "5"))
+def _env_int(name: str, default: int) -> int:
+    """🔴 v1.1 FIX (2026-09-25): `os.environ.get(k, "180")` ka default SIRF tab
+    lagta hai jab key maujood HI na ho. GitHub Actions har env var SET karta
+    hai — khali ho to bhi. Yani `LOOKBACK_DAYS=""` par `int("")` → ValueError →
+    script FORAN marti hai, koi log nahi, aur GitHub sirf "exit code 1" likhta
+    hai (wajah kahin nazar nahi aati).
+    Wahi bug adjust_to_bigquery.py mein bhi tha. Ab khali ya kharab value =
+    default, aur log mein saaf warning.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("⚠️  %s='%s' number nahi — default %d le rahe hain", name, raw, default)
+        return default
+
+
+LOOKBACK_DAYS    = _env_int("LOOKBACK_DAYS", 180)
+REQUEST_TIMEOUT  = _env_int("REQUEST_TIMEOUT", 300)
+MAX_RETRIES      = _env_int("MAX_RETRIES", 5)
 OUT_TOKENS       = os.environ.get("OUT_TOKENS", "app_tokens.txt")
 OUT_CSV          = os.environ.get("OUT_CSV", "adjust_apps.csv")
 UTC_OFFSET       = os.environ.get("UTC_OFFSET", "+00:00")
