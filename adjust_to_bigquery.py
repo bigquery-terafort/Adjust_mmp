@@ -127,15 +127,41 @@ GCP_CREDENTIALS_JSON = os.environ.get("GCP_CREDENTIALS_JSON", "").strip()
 BQ_DATASET = os.environ.get("BQ_DATASET", "adjust_data").strip()
 BQ_LOCATION = os.environ.get("BQ_LOCATION", "US").strip()
 
-LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "14"))
-COHORT_LOOKBACK_DAYS = int(os.environ.get("COHORT_LOOKBACK_DAYS", "150"))
-CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "25"))
-METRIC_BATCH_SIZE = int(os.environ.get("METRIC_BATCH_SIZE", "35"))
-MAX_WORKERS = max(1, int(os.environ.get("MAX_WORKERS", "6")))
-MAX_HTTP_IN_FLIGHT = max(1, int(os.environ.get("MAX_HTTP_IN_FLIGHT", str(MAX_WORKERS))))
+def _env_int(name: str, default: int) -> int:
+    """🔴 v4.1 FIX: `os.environ.get(k, "35")` ka default SIRF tab lagta hai jab
+    key maujood HI na ho. GitHub Actions har env var SET karta hai — khali ho to
+    bhi. Yani `METRIC_BATCH_SIZE=""` par `int("")` → ValueError → loader FORAN
+    marta hai, koi log nahi, aur GitHub sirf "Process completed with exit code 1"
+    likhta hai.
+    (2026-09-25: manual run par `prepare` ne lookback/metric_batch khali diye,
+     aur run #93 line 133 par mar gayi — wajah kahin nazar nahi aa rahi thi.)
+    Ab: khali ya kharab value = default, aur log mein saaf warning.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("⚠️  %s='%s' number nahi — default %d le rahe hain", name, raw, default)
+        return default
+
+
+def _env_str(name: str, default: str) -> str:
+    """Wahi masla strings par — khali value ko default se badlo."""
+    raw = (os.environ.get(name) or "").strip()
+    return raw if raw else default
+
+
+LOOKBACK_DAYS = _env_int("LOOKBACK_DAYS", 14)
+COHORT_LOOKBACK_DAYS = _env_int("COHORT_LOOKBACK_DAYS", 150)
+CHUNK_SIZE = _env_int("CHUNK_SIZE", 25)
+METRIC_BATCH_SIZE = _env_int("METRIC_BATCH_SIZE", 35)
+MAX_WORKERS = max(1, _env_int("MAX_WORKERS", 6))
+MAX_HTTP_IN_FLIGHT = max(1, _env_int("MAX_HTTP_IN_FLIGHT", MAX_WORKERS))
 PERSIST_CATALOGS = os.environ.get("PERSIST_CATALOGS", "1") == "1"
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "6"))
-REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "300"))
+MAX_RETRIES = _env_int("MAX_RETRIES", 6)
+REQUEST_TIMEOUT = _env_int("REQUEST_TIMEOUT", 300)
 UTC_OFFSET = os.environ.get("UTC_OFFSET", "+00:00").strip()
 REPORTING_CURRENCY = os.environ.get("REPORTING_CURRENCY", "USD").strip().upper()
 # ══ 🛡️ v3.3 (2026-09-24) — KHALI-JAWAB GUARD ══════════════════════════════
@@ -189,7 +215,7 @@ REPORT_TUNING: dict[str, dict[str, int]] = {
 }
 #  balanced = aadha · fast = jaisa hai · max = doonga (sirf bina-chhat walon par)
 _SPEED_SCALE = {"balanced": 0.5, "fast": 1.0, "max": 2.0}
-SPEED = os.environ.get("SPEED", "fast").strip().lower()
+SPEED = _env_str("SPEED", "fast").lower()
 if SPEED not in _SPEED_SCALE:
     SPEED = "fast"
 
@@ -206,24 +232,24 @@ def _tuned(report: str, key: str, fallback: int) -> int:
     return scaled
 
 
-STREAM_FLUSH_ROWS = max(1000, int(os.environ.get("STREAM_FLUSH_ROWS", "50000")))
+STREAM_FLUSH_ROWS = max(1000, _env_int("STREAM_FLUSH_ROWS", 50000))
 
 #  🔑 v3.6: buffer ki asal HAD — bytes mein. Row count report ke hisaab se
 #  bilkul alag matlab rakhta hai (campaign row = 173 fields, app row = ~20).
 #  GitHub runner ~16 GB deta hai; 400 MB buffer mehfooz hai aur BigQuery
 #  load job ke liye bhi theek size.
-STREAM_MAX_BYTES = max(50_000_000, int(os.environ.get("STREAM_MAX_BYTES", "400000000")))
+STREAM_MAX_BYTES = max(50_000_000, _env_int("STREAM_MAX_BYTES", 400000000))
 
 #  DATE CHUNKING: har app-chunk ka window bhi chhote tukron mein. 0 = band.
-DATE_CHUNK_DAYS = max(0, int(os.environ.get("DATE_CHUNK_DAYS", "0")))
+DATE_CHUNK_DAYS = max(0, _env_int("DATE_CHUNK_DAYS", 0))
 
 #  COHORT PERIOD BATCH: 66 metric families × 121 periods = ~8,000 metrics ek
 #  request mein — negotiation girti thi. 10-period batches mein 660 metrics.
-COHORT_PERIOD_BATCH = max(1, int(os.environ.get("COHORT_PERIOD_BATCH", "10")))
+COHORT_PERIOD_BATCH = max(1, _env_int("COHORT_PERIOD_BATCH", 10))
 
 ALLOW_EMPTY_WIPE = os.environ.get("ALLOW_EMPTY_WIPE", "0").strip() == "1"
 
-AD_SPEND_MODE = os.environ.get("AD_SPEND_MODE", "network").strip().lower()
+AD_SPEND_MODE = _env_str("AD_SPEND_MODE", "network").lower()
 SPEND_RECON_MODES = [x.strip().lower() for x in os.environ.get(
     "SPEND_RECON_MODES", "adjust,network,mixed").split(",") if x.strip()]
 ATTRIBUTION_SOURCE = os.environ.get("ATTRIBUTION_SOURCE", "dynamic").strip().lower()
