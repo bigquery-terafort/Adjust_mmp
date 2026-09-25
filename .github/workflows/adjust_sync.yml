@@ -77,6 +77,10 @@ jobs:
   prepare:
     name: Build Adjust run profile
     runs-on: ubuntu-latest
+    # 🔑 v4.0: har job par timeout. Bina iske GitHub 6 ghante tak chalne deta
+    #    hai — ek atka hua job poore din ke runner minutes kha jata hai.
+    #    validate.yml ka usool isi ko pakadta hai.
+    timeout-minutes: 10
     outputs:
       # 🔧 v3.3: DO matrix. CORE reports ka fail hona workflow LAAL karta hai;
       #    OPTIONAL (spend/cohort/event_cohort) abhi tajurbati hain — un ka fail
@@ -113,17 +117,25 @@ jobs:
         run: |
           set -euo pipefail
 
+          # 🔴 v4.1 FIX — MANUAL RUN PAR DEFAULTS
+          #
+          #    Ye workflow hamesha `schedule` se chalti thi, aur defaults sirf
+          #    us shaakh mein set hote the (neeche `if event_name == schedule`).
+          #    Jab "Run workflow" se MANUAL chalayi gayi aur inputs khali
+          #    chhode gaye, to LOOKBACK='' · METRIC_BATCH='' · CHUNK='' … chale
+          #    gaye. Loader ne `int('')` kiya → ValueError → foran maut, koi log
+          #    nahi, GitHub ne sirf "exit code 1" likha.
+          #    (2026-09-25 run #93 — line 133 par.)
+          #
+          #    Ab har value ka manual default hai, bilkul wahi jo daily profile
+          #    use karta hai. Loader mein bhi `_env_int` guard hai — do taraf se.
           PROFILE='manual'
-          LOOKBACK="$INPUT_LOOKBACK"
-          COHORT_LOOKBACK="$INPUT_COHORT_LOOKBACK"
-          # 🔴 v3.7 FIX: default sirf `schedule` par set hota tha. Manual run
-          #    (workflow_dispatch) mein `reports` khali chhodo to REPORTS='' ho
-          #    jata tha → python "No valid reports selected" → exit 1 → run 1
-          #    minute mein fail. (2026-09-25 06:22 par yehi hua.)
+          LOOKBACK="${INPUT_LOOKBACK:-14}"
+          COHORT_LOOKBACK="${INPUT_COHORT_LOOKBACK:-150}"
           REPORTS="${INPUT_REPORTS:-app,campaign,country,spend,cohort,event,event_cohort}"
-          COHORT_PERIODS="$INPUT_COHORT_PERIODS"
-          EVENT_PERIODS="$INPUT_EVENT_PERIODS"
-          INCLUDE_WM="$INPUT_INCLUDE_WM"
+          COHORT_PERIODS="${INPUT_COHORT_PERIODS:-all_days}"
+          EVENT_PERIODS="${INPUT_EVENT_PERIODS:-key}"
+          INCLUDE_WM="${INPUT_INCLUDE_WM:-0}"
 
           if [[ '${{ github.event_name }}' == 'schedule' ]]; then
             REPORTS='app,campaign,country,spend,cohort,event,event_cohort'
@@ -173,14 +185,16 @@ jobs:
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
           echo "lookback=$LOOKBACK" >> "$GITHUB_OUTPUT"
           echo "cohort_lookback=$COHORT_LOOKBACK" >> "$GITHUB_OUTPUT"
-          echo "chunk=$INPUT_CHUNK" >> "$GITHUB_OUTPUT"
-          echo "metric_batch=$INPUT_METRIC_BATCH" >> "$GITHUB_OUTPUT"
+          echo "chunk=${INPUT_CHUNK:-25}" >> "$GITHUB_OUTPUT"
+          echo "metric_batch=${INPUT_METRIC_BATCH:-35}" >> "$GITHUB_OUTPUT"
           echo "cohort_periods=$COHORT_PERIODS" >> "$GITHUB_OUTPUT"
           echo "event_periods=$EVENT_PERIODS" >> "$GITHUB_OUTPUT"
           echo "include_wm=$INCLUDE_WM" >> "$GITHUB_OUTPUT"
+          # start_date / end_date jaan-boojh ke khali rehte hain — loader
+          # khali ko "lookback use karo" samajhta hai (ye number nahi hain).
           echo "start_date=$INPUT_START_DATE" >> "$GITHUB_OUTPUT"
           echo "end_date=$INPUT_END_DATE" >> "$GITHUB_OUTPUT"
-          echo "dry_run=$INPUT_DRY_RUN" >> "$GITHUB_OUTPUT"
+          echo "dry_run=${INPUT_DRY_RUN:-0}" >> "$GITHUB_OUTPUT"
           echo "profile=$PROFILE" >> "$GITHUB_OUTPUT"
 
           echo "Profile: $PROFILE"
@@ -321,6 +335,7 @@ jobs:
     needs: [prepare, sync]
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       # 🔑 v4.0: matrix ki OPTIONAL entries par `continue-on-error: true` hai,
       #    is liye un ka fail hona `needs.sync.result` ko nahi chhoota.
