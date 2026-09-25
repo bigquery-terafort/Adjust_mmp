@@ -1364,7 +1364,20 @@ def atomic_replace_window(client: bigquery.Client, table_name: str, rows: list[d
     #  Sirf tab chalta hai jab: 0 rows aaye AUR schema mein `date` column ho.
     #  Query partition-pruned COUNT hai (tables `date` par partitioned hain),
     #  is liye sasti hai. Koi bhi gharbar ho to FAIL karte hain, wipe nahi.
-    # 🔑 v3.5: streaming mode mein rows staging mein ja chuke — ginti writer se.
+    # 🔴 v4.5 BUG FIX (2026-09-25):
+    #    `writer.total` SIRF flush ho chuke rows ginta hai. Buffer 50,000 rows
+    #    par flush hota hai — chhoti report (app = ~8,956 rows / 14 din) kabhi
+    #    us had tak pohanchti hi nahi, is liye `total` 0 rehta tha.
+    #    Natija: neeche wala khali-jawab guard samajhta tha "Adjust ne 0 rows
+    #    diye" aur report FAIL kar deta tha — jabke 8,956 rows buffer mein
+    #    maujood the. Live saboot (run #97):
+    #        → streaming: ~2059 bytes/row      ← rows aa rahe the
+    #        ❌ Adjust ne 0 rows diye magar 8956 rows hain
+    #    Isi liye spend/country/event (lakhon rows → flush ho jate) chal rahe
+    #    the aur app fail ho raha tha.
+    #    HAL: aakhri flush ab ginti se PEHLE — buffer khali, total sahi.
+    if writer is not None:
+        writer.flush()
     row_count = writer.total if writer is not None else len(rows)
 
     if (row_count == 0) and (not ALLOW_EMPTY_WIPE) and any(f.name == "date" for f in schema):
@@ -1393,8 +1406,7 @@ def atomic_replace_window(client: bigquery.Client, table_name: str, rows: list[d
 
     cols = [safe_ident(f.name) for f in schema]
     if writer is not None:
-        # 🔑 v3.5: streaming — staging pehle se bhari hui hai, sirf aakhri flush.
-        writer.flush()
+        # flush upar ho chuka (row_count se pehle) — yahan sirf naam chahiye.
         staging_name, staging = writer.name, writer.ref
     else:
         run_suffix = re.sub(r"[^A-Za-z0-9_]", "_", RUN_ID)[-80:]
@@ -2090,7 +2102,7 @@ def main() -> None:
     #    step isi ko grep karta hai. Badlo to workflow bhi badalna parega.
     # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI — workflow ka "Verify loader" grep.
     # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI — workflow ka "Verify loader" grep.
-    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT | loader v4.0 (self-tuning)")
+    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT | loader v4.5 (flush-before-count fix)")
     log.info("Workers: %d | max Adjust HTTP in-flight: %d | persist_catalogs=%s", MAX_WORKERS, MAX_HTTP_IN_FLIGHT, PERSIST_CATALOGS)
     for name, value in (
         ("ADJUST_API_TOKEN", ADJUST_API_TOKEN),
