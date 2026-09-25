@@ -179,6 +179,54 @@ jobs:
               sys.exit(1)
           PY
 
+      # ── 5. Python: khali env var par crash to nahi karega? ─────────────────
+      - name: 🧪 Loader khali env par
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, pathlib, re, subprocess, sys, yaml
+
+          # Workflow jo env vars deta hai, un mein se `${{ ... }}` wale KHALI ho
+          # sakte hain (prepare ka output khali ho to). Ye test wahi soorat
+          # banata hai aur loader ka module-level code chala kar dekhta hai.
+          #
+          # 🔴 2026-09-25: `int(os.environ.get("METRIC_BATCH_SIZE", "35"))` —
+          #    default sirf tab lagta hai jab key maujood NA ho. GitHub har var
+          #    SET karta hai, khali ho to bhi → int("") → ValueError → loader
+          #    foran mar gaya, aur log mein sirf "exit code 1" aaya.
+          problems = []
+          for wf in sorted(pathlib.Path('.github/workflows').glob('*.y*ml')):
+              d = yaml.safe_load(wf.read_text(encoding='utf-8'))
+              for jn, j in (d.get('jobs') or {}).items():
+                  for st in (j.get('steps') or []):
+                      run, env = st.get('run') or '', st.get('env') or {}
+                      m = re.search(r'python3?\s+(\S+\.py)', run)
+                      if not m or not pathlib.Path(m.group(1)).exists():
+                          continue
+                      script = m.group(1)
+                      # har ${{ }} value KHALI kar do — sab se bura case
+                      test_env = dict(os.environ)
+                      for k, v in env.items():
+                          test_env[k] = '' if '${{' in str(v) else str(v)
+                      test_env['REPORTS'] = 'campaign'
+                      probe = (
+                          'src = open(%r).read().split("def main(")[0]\n'
+                          'exec(compile(src, %r, "exec"), {"__name__": "notmain"})\n'
+                          % (script, script))
+                      r = subprocess.run([sys.executable, '-c', probe],
+                                         env=test_env, capture_output=True, text=True, timeout=120)
+                      if r.returncode:
+                          tail = r.stderr.strip().splitlines()[-1] if r.stderr.strip() else '?'
+                          problems.append(f"{wf}:{jn} — {script} khali env par crash: {tail}")
+                      else:
+                          print(f"  ✅ {script} khali env par theek ({jn})")
+
+          if problems:
+              print("\n🔴 MASAIL:")
+              for x in problems: print("   •", x)
+              sys.exit(1)
+          PY
+
       - name: ✅ Khulasa
         if: success()
         run: |
@@ -188,4 +236,5 @@ jobs:
             echo "- Workflow YAML + usool (timeout · fail-fast · dohri env key · needs · gh api permissions)"
             echo "- Har \`run:\` block ka bash syntax"
             echo "- Loader ↔ workflow marker"
+            echo "- Loader khali env var par crash nahi karta"
           } >> "$GITHUB_STEP_SUMMARY"
