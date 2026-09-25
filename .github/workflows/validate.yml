@@ -1,0 +1,191 @@
+name: ✅ Validate (har push par)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  KYUN YE WORKFLOW BANI
+#
+#  24–25 Sep 2026: adjust_sync.yml ek hafte tak bar bar fail hui. Har baar
+#  wajah main workflow CHALNE ke baad pata chalti thi — aur har baar log
+#  padhna parta tha. Jo bugs nikle:
+#
+#     · prepare ka bash: `eval "$(python ...)"` ne python ka exit code chhupa
+#       diya → agli line par "MATRIX_CORE: unbound variable" → 1 minute mein maut
+#     · REPORTS ka default sirf `schedule` par tha — manual run par khali
+#     · MAX_HTTP_IN_FLIGHT do baar likha tha, neeche wali upar wali ko dabaa rahi thi
+#     · loader ka version string badla to "Verify loader" step toota
+#
+#  IN SAB KO CHALNE SE PEHLE PAKDA JA SAKTA THA. Ye workflow wahi karti hai:
+#  har push par 30 second mein file ko jaanchti hai. Adjust API ko haath nahi
+#  lagati, BigQuery ko haath nahi lagati — sirf file sahi hai ya nahi.
+# ══════════════════════════════════════════════════════════════════════════════
+
+on:
+  push:
+    paths:
+      - '**.yml'
+      - '**.yaml'
+      - '**.py'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: File jaanch
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install
+        run: pip install --quiet pyyaml
+
+      # ── 1. Python: syntax ──────────────────────────────────────────────────
+      - name: 🐍 Python syntax
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r f; do
+            if python -m py_compile "$f" 2>/tmp/e; then
+              echo "  ✅ $f"
+            else
+              echo "  🔴 $f"; sed 's/^/       /' /tmp/e; fail=1
+            fi
+          done < <(git ls-files '*.py')
+          exit $fail
+
+      # ── 2. YAML: syntax + workflow ke usool ────────────────────────────────
+      - name: 📄 Workflow YAML
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys, yaml, pathlib, re
+
+          problems = []
+          for p in sorted(pathlib.Path('.github/workflows').glob('*.y*ml')):
+              try:
+                  d = yaml.safe_load(p.read_text(encoding='utf-8'))
+              except Exception as e:
+                  problems.append(f"{p}: YAML parse fail — {e}")
+                  continue
+              print(f"  ✅ {p} parse hua")
+
+              on = d.get(True) or d.get('on') or {}
+              jobs = d.get('jobs') or {}
+              if not jobs:
+                  problems.append(f"{p}: koi job nahi")
+
+              for jn, j in jobs.items():
+                  # har job ka timeout hona chahiye — warna 6 ghante zaya
+                  if 'timeout-minutes' not in j:
+                      problems.append(f"{p}:{jn} — timeout-minutes nahi hai")
+
+                  # matrix job par fail-fast: false (ek leg fail = baqi cancel)
+                  st = j.get('strategy') or {}
+                  if 'matrix' in st and st.get('fail-fast') is not False:
+                      problems.append(f"{p}:{jn} — matrix hai magar fail-fast: false nahi")
+
+                  # env mein ek hi key do baar (chupa hua override)
+                  for s in (j.get('steps') or []):
+                      env = s.get('env') or {}
+                      raw = yaml.safe_load(yaml.safe_dump(env))
+                      if len(raw) != len(env):
+                          problems.append(f"{p}:{jn} — env mein dohri key")
+
+                  # `needs` mein aisa job jo hai hi nahi
+                  needs = j.get('needs') or []
+                  needs = [needs] if isinstance(needs, str) else needs
+                  for nd in needs:
+                      if nd not in jobs:
+                          problems.append(f"{p}:{jn} — needs '{nd}' maujood nahi")
+
+              # gh api use kar rahe ho to actions: read chahiye
+              txt = p.read_text(encoding='utf-8')
+              if re.search(r'^\s*(run:.*)?gh api', txt, re.M):
+                  perms = d.get('permissions') or {}
+                  if isinstance(perms, dict) and perms.get('actions') != 'read':
+                      problems.append(f"{p}: `gh api` use hai magar `permissions: actions: read` nahi — 403 aayega")
+
+          if problems:
+              print("\n🔴 MASAIL:")
+              for x in problems:
+                  print("   •", x)
+              sys.exit(1)
+          print("\n✅ saarey workflow theek")
+          PY
+
+      # ── 3. Bash: har `run:` block shellcheck-safe ──────────────────────────
+      - name: 🐚 Bash jaanch
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends shellcheck >/dev/null 2>&1 || true
+          python - <<'PY'
+          import yaml, pathlib, subprocess, os, re, sys
+          bad = 0
+          for p in sorted(pathlib.Path('.github/workflows').glob('*.y*ml')):
+              d = yaml.safe_load(p.read_text(encoding='utf-8'))
+              for jn, j in (d.get('jobs') or {}).items():
+                  for i, s in enumerate(j.get('steps') or []):
+                      run = s.get('run')
+                      if not run or (s.get('shell') and s['shell'] != 'bash'):
+                          continue
+                      # GitHub expressions ko placeholder se badlo (bash unhe nahi samajhta)
+                      script = re.sub(r'\$\{\{[^}]*\}\}', 'GHEXPR', run)
+                      fn = f"/tmp/_{jn}_{i}.sh"
+                      open(fn, 'w').write("#!/usr/bin/env bash\n" + script)
+                      r = subprocess.run(['bash', '-n', fn], capture_output=True, text=True)
+                      if r.returncode:
+                          print(f"  🔴 {p}:{jn} step {i} ({s.get('name','?')})")
+                          print("     ", r.stderr.strip()[:300]); bad = 1
+          print("  ✅ saarey bash blocks syntax-clean" if not bad else "")
+          sys.exit(bad)
+          PY
+
+      # ── 4. Loader ↔ workflow ka rabt ───────────────────────────────────────
+      - name: 🔗 Loader ↔ workflow
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import yaml, pathlib, re, sys
+          problems = []
+
+          # "Verify loader" step jis string ko grep karta hai, wo loader mein ho
+          for p in pathlib.Path('.github/workflows').glob('*.y*ml'):
+              txt = p.read_text(encoding='utf-8')
+              for m in re.finditer(r"grep -q '([^']+)' (\S+\.py)", txt):
+                  marker, pyfile = m.group(1), m.group(2)
+                  f = pathlib.Path(pyfile)
+                  if not f.exists():
+                      problems.append(f"{p}: '{pyfile}' maujood nahi")
+                  elif marker not in f.read_text(encoding='utf-8'):
+                      problems.append(
+                          f"{p}: loader mein '{marker}' nahi mila — "
+                          f"'Verify loader' step fail karega")
+                  else:
+                      print(f"  ✅ marker '{marker}' {pyfile} mein maujood")
+
+          if problems:
+              print("\n🔴 MASAIL:")
+              for x in problems: print("   •", x)
+              sys.exit(1)
+          PY
+
+      - name: ✅ Khulasa
+        if: success()
+        run: |
+          {
+            echo "## ✅ Validation pass"
+            echo "- Python syntax"
+            echo "- Workflow YAML + usool (timeout · fail-fast · dohri env key · needs · gh api permissions)"
+            echo "- Har \`run:\` block ka bash syntax"
+            echo "- Loader ↔ workflow marker"
+          } >> "$GITHUB_STEP_SUMMARY"
