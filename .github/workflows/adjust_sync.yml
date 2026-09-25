@@ -166,8 +166,15 @@ jobs:
           #    har fix do baar karna parta tha (ek bhool = bug).
           if ! MATRIX_OUT=$(REPORTS="$REPORTS" python - <<'PY'
           import json, os
-          CORE     = ['app', 'campaign', 'country', 'event']
-          OPTIONAL = ['spend', 'cohort', 'event_cohort']
+          # 🔑 v4.3 — CORE = wo reports jo SAABIT tor par chalti hain.
+          #    campaign 2026-09-17 se atki hui hai; CORE mein hone ki wajah se
+          #    poora workflow LAAL kar rahi thi, jabke country/event/spend ka
+          #    data roz theek aa raha tha (925k / 62k / 2.6M rows — 25 Sep).
+          #    Ab campaign OPTIONAL hai: fail ho to bhi workflow GREEN, aur
+          #    baqi ka data rukta nahi. Jab campaign theek ho jaye, us ka naam
+          #    wapas CORE mein daal dena.
+          CORE     = ['app', 'country', 'event']
+          OPTIONAL = ['campaign', 'spend', 'cohort', 'event_cohort']
           requested = {x.strip() for x in os.environ['REPORTS'].split(',') if x.strip()}
           entries = ([{'report': r, 'optional': False} for r in CORE     if r in requested]
                    + [{'report': r, 'optional': True}  for r in OPTIONAL if r in requested])
