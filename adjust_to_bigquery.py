@@ -209,9 +209,11 @@ REPORT_TUNING: dict[str, dict[str, int]] = {
     # 🔴 v4.6: cohort/event_cohort par RAM 11 GB tak chali gayi thi (run #98).
     #    Ek app-chunk × 15-din window = 3.5 LAKH rows. Ab chunk 5 apps aur
     #    window 5 din — har fetch ~8x chhoti, RAM 1-2 GB mein rehti hai.
-    "campaign":      {"workers": 4,  "chunk": 10, "date_days": 7,  "capped": 1},
-    "cohort":        {"workers": 3,  "chunk": 5,  "date_days": 5,  "capped": 1},
-    "event_cohort":  {"workers": 3,  "chunk": 5,  "date_days": 5,  "capped": 1},
+    # 🔴 v4.7: run #99 — campaign 10 apps × 7 din par bhi RAM 10 GB. Ab 3 apps
+    #    × 3 din: har fetch ~8× chhoti. Requests zyada, magar har ek halki.
+    "campaign":      {"workers": 3,  "chunk": 3,  "date_days": 3,  "capped": 1},
+    "cohort":        {"workers": 3,  "chunk": 3,  "date_days": 3,  "capped": 1},
+    "event_cohort":  {"workers": 3,  "chunk": 3,  "date_days": 3,  "capped": 1},
     "spend":         {"workers": 6,  "chunk": 15, "date_days": 0,  "capped": 1},
     "app":           {"workers": 12, "chunk": 50, "date_days": 0,  "capped": 0},
     "country":       {"workers": 10, "chunk": 40, "date_days": 0,  "capped": 0},
@@ -237,6 +239,16 @@ def _tuned(report: str, key: str, fallback: int) -> int:
 
 
 STREAM_FLUSH_ROWS = max(1000, _env_int("STREAM_FLUSH_ROWS", 25000))
+
+# 🔴 v4.7 (2026-09-25) — RSS-BASED FLUSH (asal hal)
+#    Run #99 ka log:
+#        flush har 48999 rows · +48999 rows → RAM 3,644 → 4,085 → 6,135 → 10,254 MB
+#    `json.dumps` ne 2,449 bytes/row kaha, magar 49k rows par RAM 4 GB barhi —
+#    yani asal ~80 KB/row. Python dict 173 keys ke saath JSON se 10-30× bara
+#    hota hai. Bytes/row ka andaza BEKAAR hai.
+#    AB: flush ka faisla ASAL RAM par. RSS is had se ooper → foran flush,
+#    chahe buffer mein 500 rows hon. Ye zameen ki haqeeqat hai, andaza nahi.
+STREAM_MAX_RSS_MB = max(500, _env_int("STREAM_MAX_RSS_MB", 2500))
 
 #  🔑 v3.6: buffer ki asal HAD — bytes mein. Row count report ke hisaab se
 #  bilkul alag matlab rakhta hai (campaign row = 173 fields, app row = ~20).
@@ -1237,6 +1249,18 @@ def safe_ident(name: str) -> str:
     return name
 
 
+def _rss_mb() -> int:
+    """🔴 v4.7: process ki ASAL RAM (MB). 0 = na parh sake."""
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return 0
+
+
 def _rss_hint() -> str:
     """🔴 v3.7: process ki asal RAM. GitHub runner OOM par sirf
     "The operation was canceled." likhta hai — koi wajah nahi deta. Ye line
@@ -1315,6 +1339,13 @@ class StagingWriter:
 
         while len(self._buf) >= self._flush_at:
             self.flush()
+
+        # 🔴 v4.7: ASAL RAM check — andaze par bharosa nahi.
+        if self._buf and _rss_mb() >= STREAM_MAX_RSS_MB:
+            log.warning("   ⚠️  RAM %d MB ≥ %d MB — foran flush (%d rows)",
+                        _rss_mb(), STREAM_MAX_RSS_MB, len(self._buf))
+            self.flush()
+            import gc; gc.collect()
 
     def flush(self):
         if not self._buf:
@@ -1698,17 +1729,23 @@ def fetch_app_chunks_parallel(tokens: list[str], start: date, end: date, dimensi
     #    AB: sirf `limit` futures ek waqt mein. Ek khatam ho, uska data yield ho
     #    kar FREE ho, tab agla submit hota hai. Memory bounded reh-ti hai.
     limit = worker_count(len(tasks))
+    # 🔴 v4.7: in-flight = limit (pehle limit×2). Har mukammal future apna
+    #    parsed dict-list thaame rakhta hai — bhaari report par wo GB mein hota
+    #    hai. Kam in-flight = kam RAM. Thora sust, magar zinda.
+    inflight = limit
     with ThreadPoolExecutor(max_workers=limit, thread_name_prefix="adjust-chunk") as pool:
         it = iter(tasks)
-        pending = {pool.submit(do_one, *t) for t in itertools.islice(it, limit * 2)}
+        pending = {pool.submit(do_one, *t) for t in itertools.islice(it, inflight)}
         while pending:
             done, pending = wait(pending, return_when=FIRST_COMPLETED)
             for fut in done:
                 try:
-                    yield fut.result()
+                    res = fut.result()
                 except Exception as exc:
                     log.exception("%s worker crashed: %s", label_prefix, exc)
-                    yield (-1, [], None)
+                    res = (-1, [], None)
+                yield res
+                del res            # 🔴 v4.7: reference foran chhodo — GC kar sake
                 # ek nikla, ek daalo — in-flight ginti wahi rehti hai
                 nxt = next(it, None)
                 if nxt is not None:
@@ -2135,7 +2172,7 @@ def main() -> None:
     #    step isi ko grep karta hai. Badlo to workflow bhi badalna parega.
     # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI — workflow ka "Verify loader" grep.
     # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI — workflow ka "Verify loader" grep.
-    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT | loader v4.6 (bounded memory)")
+    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT | loader v4.7 (RSS-based flush)")
     log.info("Workers: %d | max Adjust HTTP in-flight: %d | persist_catalogs=%s", MAX_WORKERS, MAX_HTTP_IN_FLIGHT, PERSIST_CATALOGS)
     for name, value in (
         ("ADJUST_API_TOKEN", ADJUST_API_TOKEN),
