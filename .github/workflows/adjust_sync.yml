@@ -247,9 +247,17 @@ jobs:
           #    "The operation was canceled." ab nahi aayega.
           STREAM_FLUSH_ROWS: '50000'
 
+          # 🔴 v3.7: buffer ki had 400 MB → 120 MB. Runner par bohot si aur
+          #    cheezein bhi memory leti hain (HTTP responses, JSON parse).
+          STREAM_MAX_BYTES: '120000000'
+
           # 🔑 v3.5 DATE CHUNKING: campaign sab se bhaari (23 dims × 150 metrics).
           #    7-din ke tukron mein har request chhoti rehti hai.
-          DATE_CHUNK_DAYS: ${{ matrix.report == 'campaign' && '7' || '0' }}
+          # 🔴 v3.7: cohort ko bhi date-chunking. Us ka window 150 din ka hai.
+          DATE_CHUNK_DAYS: >-
+            ${{ (matrix.report == 'campaign' && '7')
+                || (matrix.report == 'cohort' && '15')
+                || '0' }}
 
           # 🔑 v3.5 COHORT PERIOD BATCH: 66 families × 121 periods = ~8,000
           #    metrics ek request mein — negotiation girti thi. 10 ke batches.
@@ -275,20 +283,32 @@ jobs:
           #       ULTA SUST ho jata hai. 'fast' se shuru karein; log mein
           #       "retrying in Ns" bohot dikhe to 'balanced' kar dein.
           MAX_WORKERS: >-
-            ${{ (contains('campaign cohort spend event_cohort', matrix.report)
-                 && (inputs.speed == 'balanced' && '4' || inputs.speed == 'fast' && '8' || '12'))
-                || (inputs.speed == 'balanced' && '2' || inputs.speed == 'fast' && '4' || '6') }}
+            ${{ (contains('campaign cohort event_cohort spend', matrix.report)
+                 && (inputs.speed == 'balanced' && '2' || inputs.speed == 'fast' && '3' || '4'))
+                || (inputs.speed == 'balanced' && '4' || inputs.speed == 'fast' && '8' || '12') }}
 
           # HTTP gate = workers. Kam rakhne ka faida nahi — workers khali baithenge.
           MAX_HTTP_IN_FLIGHT: >-
-            ${{ (contains('campaign cohort spend event_cohort', matrix.report)
-                 && (inputs.speed == 'balanced' && '4' || inputs.speed == 'fast' && '8' || '12'))
-                || (inputs.speed == 'balanced' && '2' || inputs.speed == 'fast' && '4' || '6') }}
+            ${{ (contains('campaign cohort event_cohort spend', matrix.report)
+                 && (inputs.speed == 'balanced' && '2' || inputs.speed == 'fast' && '3' || '4'))
+                || (inputs.speed == 'balanced' && '4' || inputs.speed == 'fast' && '8' || '12') }}
 
           # 🔑 CHUNK_SIZE: ek request mein kitne app tokens. Bara chunk = kam
           #    requests = tez. Streaming ki wajah se memory ab masla nahi.
           #    141 apps: 25 → 6 requests, 50 → 3 requests per window.
-          CHUNK_SIZE: ${{ inputs.speed == 'balanced' && '25' || '50' }}
+          # 🔴 v3.7 (2026-09-25): BHAARI reports ko CHHOTA chunk, halke ko BARA.
+          #    Pehle main ne ULTA kiya tha — campaign (23 dims × 150 metrics) ko
+          #    sab se bara chunk (50 apps) aur sab se zyada workers (12) diye the.
+          #    Natija: 12 concurrent × 50 apps × 23 dims ka JSON response ek saath
+          #    memory mein → runner OOM → "The operation was canceled."
+          #    SABOOT: spend (11 dims) 1,913,900 rows ke saath KAAMYAB chala,
+          #            campaign (23 dims) write se pehle hi mar gaya.
+          #    Ab: campaign/cohort → 10 apps per request, 4 workers.
+          #        Zyada requests, magar har ek chhoti — yehi mehfooz hai.
+          CHUNK_SIZE: >-
+            ${{ (contains('campaign cohort event_cohort spend', matrix.report)
+                 && (inputs.speed == 'balanced' && '5' || inputs.speed == 'fast' && '8' || '10'))
+                || (inputs.speed == 'balanced' && '25' || '50') }}
 
           # 🔧 v3.5: purana `MAX_HTTP_IN_FLIGHT: '4'` yahan se hataya — wo upar
           #    wali speed-aware value ko override kar raha tha, jis se 12 workers
@@ -396,9 +416,17 @@ jobs:
           #    "The operation was canceled." ab nahi aayega.
           STREAM_FLUSH_ROWS: '50000'
 
+          # 🔴 v3.7: buffer ki had 400 MB → 120 MB. Runner par bohot si aur
+          #    cheezein bhi memory leti hain (HTTP responses, JSON parse).
+          STREAM_MAX_BYTES: '120000000'
+
           # 🔑 v3.5 DATE CHUNKING: campaign sab se bhaari (23 dims × 150 metrics).
           #    7-din ke tukron mein har request chhoti rehti hai.
-          DATE_CHUNK_DAYS: ${{ matrix.report == 'campaign' && '7' || '0' }}
+          # 🔴 v3.7: cohort ko bhi date-chunking. Us ka window 150 din ka hai.
+          DATE_CHUNK_DAYS: >-
+            ${{ (matrix.report == 'campaign' && '7')
+                || (matrix.report == 'cohort' && '15')
+                || '0' }}
 
           # 🔑 v3.5 COHORT PERIOD BATCH: 66 families × 121 periods = ~8,000
           #    metrics ek request mein — negotiation girti thi. 10 ke batches.
@@ -424,20 +452,32 @@ jobs:
           #       ULTA SUST ho jata hai. 'fast' se shuru karein; log mein
           #       "retrying in Ns" bohot dikhe to 'balanced' kar dein.
           MAX_WORKERS: >-
-            ${{ (contains('campaign cohort spend event_cohort', matrix.report)
-                 && (inputs.speed == 'balanced' && '4' || inputs.speed == 'fast' && '8' || '12'))
-                || (inputs.speed == 'balanced' && '2' || inputs.speed == 'fast' && '4' || '6') }}
+            ${{ (contains('campaign cohort event_cohort spend', matrix.report)
+                 && (inputs.speed == 'balanced' && '2' || inputs.speed == 'fast' && '3' || '4'))
+                || (inputs.speed == 'balanced' && '4' || inputs.speed == 'fast' && '8' || '12') }}
 
           # HTTP gate = workers. Kam rakhne ka faida nahi — workers khali baithenge.
           MAX_HTTP_IN_FLIGHT: >-
-            ${{ (contains('campaign cohort spend event_cohort', matrix.report)
-                 && (inputs.speed == 'balanced' && '4' || inputs.speed == 'fast' && '8' || '12'))
-                || (inputs.speed == 'balanced' && '2' || inputs.speed == 'fast' && '4' || '6') }}
+            ${{ (contains('campaign cohort event_cohort spend', matrix.report)
+                 && (inputs.speed == 'balanced' && '2' || inputs.speed == 'fast' && '3' || '4'))
+                || (inputs.speed == 'balanced' && '4' || inputs.speed == 'fast' && '8' || '12') }}
 
           # 🔑 CHUNK_SIZE: ek request mein kitne app tokens. Bara chunk = kam
           #    requests = tez. Streaming ki wajah se memory ab masla nahi.
           #    141 apps: 25 → 6 requests, 50 → 3 requests per window.
-          CHUNK_SIZE: ${{ inputs.speed == 'balanced' && '25' || '50' }}
+          # 🔴 v3.7 (2026-09-25): BHAARI reports ko CHHOTA chunk, halke ko BARA.
+          #    Pehle main ne ULTA kiya tha — campaign (23 dims × 150 metrics) ko
+          #    sab se bara chunk (50 apps) aur sab se zyada workers (12) diye the.
+          #    Natija: 12 concurrent × 50 apps × 23 dims ka JSON response ek saath
+          #    memory mein → runner OOM → "The operation was canceled."
+          #    SABOOT: spend (11 dims) 1,913,900 rows ke saath KAAMYAB chala,
+          #            campaign (23 dims) write se pehle hi mar gaya.
+          #    Ab: campaign/cohort → 10 apps per request, 4 workers.
+          #        Zyada requests, magar har ek chhoti — yehi mehfooz hai.
+          CHUNK_SIZE: >-
+            ${{ (contains('campaign cohort event_cohort spend', matrix.report)
+                 && (inputs.speed == 'balanced' && '5' || inputs.speed == 'fast' && '8' || '10'))
+                || (inputs.speed == 'balanced' && '25' || '50') }}
 
           # 🔧 v3.5: purana `MAX_HTTP_IN_FLIGHT: '4'` yahan se hataya — wo upar
           #    wali speed-aware value ko override kar raha tha, jis se 12 workers
