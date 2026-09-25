@@ -642,6 +642,10 @@ def http_get_json(url: str, params: dict[str, Any], label: str, quiet: bool = Fa
             if r.status_code == 200:
                 # 🔑 v3.6: saaf chal raha hai to gate ko dheere dheere wapas upar.
                 _HTTP_GATE.maybe_recover()
+                # 🔴 v3.7: bara response mila to RAM ke saath log karo.
+                if len(body) > 20_000_000:
+                    log.warning("📦 %s: bara response %.0f MB%s",
+                                label, len(body) / 1e6, _rss_hint())
                 return body, ""
 
             if isinstance(body, dict):
@@ -1133,6 +1137,22 @@ def safe_ident(name: str) -> str:
     return name
 
 
+def _rss_hint() -> str:
+    """🔴 v3.7: process ki asal RAM. GitHub runner OOM par sirf
+    "The operation was canceled." likhta hai — koi wajah nahi deta. Ye line
+    log mein memory ka safar dikhati hai, taake agli baar andaza na lagana pare.
+    Koi extra package nahi — /proc/self/status Linux par hamesha hota hai."""
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    mb = int(line.split()[1]) // 1024
+                    return f" · RAM {mb} MB"
+    except Exception:
+        pass
+    return ""
+
+
 class StagingWriter:
     """🔑 v3.5: rows ko memory mein jama karne ke bajaye staging table mein
     batch-by-batch bhejta hai. Memory hamesha ek batch jitni.
@@ -1209,7 +1229,9 @@ class StagingWriter:
         if job.output_rows != len(batch):
             raise RuntimeError(f"staging row mismatch expected={len(batch)} loaded={job.output_rows}")
         self.total += len(batch)
-        log.info("   → staging: +%d rows (kul %d)", len(batch), self.total)
+        # 🔴 v3.7: ASAL memory log karo. Ab tak hum andaza laga rahe the ke OOM
+        #    hai; ye line agli run mein saaf bata degi kitni RAM lagi.
+        log.info("   → staging: +%d rows (kul %d)%s", len(batch), self.total, _rss_hint())
 
     def drop(self):
         if self._created:
@@ -1974,7 +1996,7 @@ def main() -> None:
     #    step isi ko grep karta hai. Badlo to workflow bhi badalna parega.
     # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI — workflow ka "Verify loader" grep.
     # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI — workflow ka "Verify loader" grep.
-    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT | loader v3.6 (streaming + adaptive)")
+    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT | loader v3.7 (right-sized + RAM log)")
     log.info("Workers: %d | max Adjust HTTP in-flight: %d | persist_catalogs=%s", MAX_WORKERS, MAX_HTTP_IN_FLIGHT, PERSIST_CATALOGS)
     for name, value in (
         ("ADJUST_API_TOKEN", ADJUST_API_TOKEN),
