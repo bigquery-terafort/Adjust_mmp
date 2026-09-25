@@ -97,7 +97,8 @@ import sys
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import itertools
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
@@ -205,9 +206,12 @@ ALLOW_EMPTY_WIPE = os.environ.get("ALLOW_EMPTY_WIPE", "0").strip() == "1"
 #     chunkar wahi ghalti dobara karega. Neeche jaana (balanced) hamesha theek.
 REPORT_TUNING: dict[str, dict[str, int]] = {
     #  report          workers  apps/request  date-chunk (din)  chhat?
+    # 🔴 v4.6: cohort/event_cohort par RAM 11 GB tak chali gayi thi (run #98).
+    #    Ek app-chunk × 15-din window = 3.5 LAKH rows. Ab chunk 5 apps aur
+    #    window 5 din — har fetch ~8x chhoti, RAM 1-2 GB mein rehti hai.
     "campaign":      {"workers": 4,  "chunk": 10, "date_days": 7,  "capped": 1},
-    "cohort":        {"workers": 4,  "chunk": 10, "date_days": 15, "capped": 1},
-    "event_cohort":  {"workers": 4,  "chunk": 10, "date_days": 15, "capped": 1},
+    "cohort":        {"workers": 3,  "chunk": 5,  "date_days": 5,  "capped": 1},
+    "event_cohort":  {"workers": 3,  "chunk": 5,  "date_days": 5,  "capped": 1},
     "spend":         {"workers": 6,  "chunk": 15, "date_days": 0,  "capped": 1},
     "app":           {"workers": 12, "chunk": 50, "date_days": 0,  "capped": 0},
     "country":       {"workers": 10, "chunk": 40, "date_days": 0,  "capped": 0},
@@ -232,13 +236,15 @@ def _tuned(report: str, key: str, fallback: int) -> int:
     return scaled
 
 
-STREAM_FLUSH_ROWS = max(1000, _env_int("STREAM_FLUSH_ROWS", 50000))
+STREAM_FLUSH_ROWS = max(1000, _env_int("STREAM_FLUSH_ROWS", 25000))
 
 #  🔑 v3.6: buffer ki asal HAD — bytes mein. Row count report ke hisaab se
 #  bilkul alag matlab rakhta hai (campaign row = 173 fields, app row = ~20).
 #  GitHub runner ~16 GB deta hai; 400 MB buffer mehfooz hai aur BigQuery
 #  load job ke liye bhi theek size.
-STREAM_MAX_BYTES = max(50_000_000, _env_int("STREAM_MAX_BYTES", 400000000))
+# 🔴 v4.6: 400 MB → 80 MB. Runner par 4 workers ke responses + JSON parse +
+#    buffer sab ek saath chalte hain. Bara buffer akela hi RAM kha jata tha.
+STREAM_MAX_BYTES = max(20_000_000, _env_int("STREAM_MAX_BYTES", 80_000_000))
 
 #  DATE CHUNKING: har app-chunk ka window bhi chhote tukron mein. 0 = band.
 DATE_CHUNK_DAYS = max(0, _env_int("DATE_CHUNK_DAYS", 0))
@@ -1290,6 +1296,10 @@ class StagingWriter:
             return
         self._buf.extend(rows)
 
+        # 🔴 v4.6: ek `add()` mein 3.5 LAKH rows aa sakte hain (cohort par asal
+        #    mein aaye — ≈818 MB ek batch). Flush `add` ke BAAD chalta tha, is
+        #    liye buffer pehle utna bara ho jata tha. Ab jab tak buffer had se
+        #    ooper hai, baar baar flush karo — tukron mein.
         if self._row_bytes is None and len(self._buf) >= 200:
             # ek baar naap lo — 200 rows ka namoona
             try:
@@ -1303,14 +1313,17 @@ class StagingWriter:
                 self._row_bytes = 0
                 self._flush_at = STREAM_FLUSH_ROWS
 
-        if len(self._buf) >= self._flush_at:
+        while len(self._buf) >= self._flush_at:
             self.flush()
 
     def flush(self):
         if not self._buf:
             return
         self._create()
-        batch, self._buf = self._buf, []      # buffer foran khali — memory free
+        # 🔴 v4.6: ek baar mein sirf `_flush_at` rows lo — poora buffer nahi.
+        #    Warna 350k rows ka JSON ek saath banta hai (≈800 MB spike).
+        take = self._flush_at if len(self._buf) > self._flush_at else len(self._buf)
+        batch, self._buf = self._buf[:take], self._buf[take:]
         job = self.client.load_table_from_json(
             batch, self.ref,
             job_config=bigquery.LoadJobConfig(
@@ -1672,14 +1685,34 @@ def fetch_app_chunks_parallel(tokens: list[str], start: date, end: date, dimensi
              for ci, ac in enumerate(chunks, 1)
              for wi, (ws, we) in enumerate(windows, 1)]
 
-    with ThreadPoolExecutor(max_workers=worker_count(len(tasks)), thread_name_prefix="adjust-chunk") as pool:
-        futures = [pool.submit(do_one, *t) for t in tasks]
-        for fut in as_completed(futures):
-            try:
-                yield fut.result()
-            except Exception as exc:
-                log.exception("%s worker crashed: %s", label_prefix, exc)
-                yield (-1, [], None)
+    # 🔴 v4.6 — BOUNDED IN-FLIGHT (asal memory leak ka hal)
+    #    PEHLE: `futures = [pool.submit(do_one, *t) for t in tasks]` — SAAREY
+    #    tasks ek saath submit hote the (cohort par 150+). Har MUKAMMAL future
+    #    apna rows-list THAAM kar rakhta hai jab tak consumer us tak na pohanche.
+    #    Workers aage bhagte rehte the, is liye darjanon bare nataij ek saath
+    #    memory mein rehte the aur RAM kabhi neeche nahi aati thi.
+    #    Live saboot (run #98, cohort):
+    #        +350750 rows · RAM  8,075 MB
+    #        +371930 rows · RAM 10,008 MB
+    #        +352130 rows · RAM 11,249 MB  →  "The operation was canceled."
+    #    AB: sirf `limit` futures ek waqt mein. Ek khatam ho, uska data yield ho
+    #    kar FREE ho, tab agla submit hota hai. Memory bounded reh-ti hai.
+    limit = worker_count(len(tasks))
+    with ThreadPoolExecutor(max_workers=limit, thread_name_prefix="adjust-chunk") as pool:
+        it = iter(tasks)
+        pending = {pool.submit(do_one, *t) for t in itertools.islice(it, limit * 2)}
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for fut in done:
+                try:
+                    yield fut.result()
+                except Exception as exc:
+                    log.exception("%s worker crashed: %s", label_prefix, exc)
+                    yield (-1, [], None)
+                # ek nikla, ek daalo — in-flight ginti wahi rehti hai
+                nxt = next(it, None)
+                if nxt is not None:
+                    pending.add(pool.submit(do_one, *nxt))
 
 # -----------------------------------------------------------------------------
 # Base reports
@@ -2102,7 +2135,7 @@ def main() -> None:
     #    step isi ko grep karta hai. Badlo to workflow bhi badalna parega.
     # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI — workflow ka "Verify loader" grep.
     # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI — workflow ka "Verify loader" grep.
-    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT | loader v4.5 (flush-before-count fix)")
+    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT | loader v4.6 (bounded memory)")
     log.info("Workers: %d | max Adjust HTTP in-flight: %d | persist_catalogs=%s", MAX_WORKERS, MAX_HTTP_IN_FLIGHT, PERSIST_CATALOGS)
     for name, value in (
         ("ADJUST_API_TOKEN", ADJUST_API_TOKEN),
