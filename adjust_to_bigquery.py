@@ -293,15 +293,19 @@ _ACTIVE = ENABLED_REPORTS[0] if len(ENABLED_REPORTS) == 1 else min(
     ENABLED_REPORTS, key=lambda r: REPORT_TUNING.get(r, {}).get("workers", 99),
     default="app")
 
-if "MAX_WORKERS" not in os.environ:
+def _env_set(name: str) -> bool:
+    """🔴 v4.8: 'set' = maujood AUR khali nahi. GitHub khali env bhi bhejta hai —
+    us par bhi tuning lagni chahiye, warna default 6/25 par sab reports ek jaisa."""
+    return bool((os.environ.get(name) or "").strip())
+
+if not _env_set("MAX_WORKERS"):
     MAX_WORKERS = _tuned(_ACTIVE, "workers", 6)
-if "MAX_HTTP_IN_FLIGHT" not in os.environ:
+if not _env_set("MAX_HTTP_IN_FLIGHT"):
     MAX_HTTP_IN_FLIGHT = MAX_WORKERS
     # 🔑 gate yahan NAHI banate — `_AdaptiveGate` class neeche define hoti hai.
-    #    Wahan ye value apne aap uthai jayegi.
-if "CHUNK_SIZE" not in os.environ:
+if not _env_set("CHUNK_SIZE"):
     CHUNK_SIZE = _tuned(_ACTIVE, "chunk", 25)
-if "DATE_CHUNK_DAYS" not in os.environ:
+if not _env_set("DATE_CHUNK_DAYS"):
     DATE_CHUNK_DAYS = _tuned(_ACTIVE, "date_days", 0)
 
 log.info("⚙️  tuning [%s] speed=%s → workers=%d · chunk=%d apps · date_chunk=%s din",
@@ -1638,6 +1642,30 @@ def persist_catalogs(client: bigquery.Client, filters: dict[str, list[dict[str, 
 # -----------------------------------------------------------------------------
 # Parallel fetch helpers
 # -----------------------------------------------------------------------------
+def _bounded_map(fn, jobs: list, limit: int, prefix: str):
+    """🔴 v4.8: `[pool.submit(...) for j in jobs]` + `as_completed` ka mehfooz badal.
+    Purana pattern SAAREY jobs ek saath submit karta tha; har mukammal future
+    apna nateeja thaame rakhta tha jab tak consumer na pohanche → RAM barh kar
+    OOM (event_cohort 29 min chal kar isi par mara, run #98).
+    Ye sirf `limit` in-flight rakhta hai: ek nikla, ek daala. Yields fn(job)."""
+    limit = max(1, limit)
+    with ThreadPoolExecutor(max_workers=limit, thread_name_prefix=prefix) as pool:
+        it = iter(jobs)
+        pending = {pool.submit(fn, j) for j in itertools.islice(it, limit)}
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for fut in done:
+                try:
+                    res = fut.result()
+                except Exception as exc:
+                    res = exc
+                yield res
+                del res
+                nxt = next(it, None)
+                if nxt is not None:
+                    pending.add(pool.submit(fn, nxt))
+
+
 def fetch_app_chunks_parallel(tokens: list[str], start: date, end: date, dimensions: list[str],
                               metrics: list[str], label_prefix: str, *, ad_spend_mode: str,
                               cohort_maturity: str | None = None):
@@ -1978,9 +2006,14 @@ def run_event_daily(client: bigquery.Client | None, tokens: list[str], start: da
         return ev, slug, metric, eligible_tokens
 
     prepared = []
-    with ThreadPoolExecutor(max_workers=worker_count(len(events)), thread_name_prefix="adjust-event-probe") as pool:
-        futures = [pool.submit(prepare_event, ev) for ev in events]
-        for fut in as_completed(futures):
+    for _pf in _bounded_map(prepare_event, events, worker_count(len(events)), "adjust-event-probe"):
+        class _F:                      # v4.8: _bounded_map se result ko purane .result() shape mein
+            def __init__(self, r): self._r = r
+            def result(self):
+                if isinstance(self._r, Exception): raise self._r
+                return self._r
+        fut = _F(_pf)
+        if True:
             try:
                 item = fut.result()
                 if item is not None:
@@ -2001,19 +2034,19 @@ def run_event_daily(client: bigquery.Client | None, tokens: list[str], start: da
         )
         return ev, slug, metric, ci, app_chunk, raw
 
+    # 🔴 v4.8: streaming + bounded — pehle `all_rows` mein sab jama hota tha.
+    writer = StagingWriter(client, "event_daily_performance", schema) if (client is not None and not DRY_RUN) else None
     completed = 0
-    with ThreadPoolExecutor(max_workers=worker_count(len(jobs)), thread_name_prefix="adjust-event") as pool:
-        futures = [pool.submit(fetch_event_job, job) for job in jobs]
-        for fut in as_completed(futures):
+    for res in _bounded_map(fetch_event_job, jobs, worker_count(len(jobs)), "adjust-event"):
             completed += 1
-            try:
-                ev, slug, metric, ci, app_chunk, raw = fut.result()
-            except Exception as exc:
-                record_failure("event_worker", exc)
+            if isinstance(res, Exception):
+                record_failure("event_worker", res)
                 continue
+            ev, slug, metric, ci, app_chunk, raw = res
             if raw is None:
                 record_failure(f"event:{slug}:chunk{ci}", "fetch failed")
                 continue
+            batch: list[dict[str, Any]] = []
             for rr in raw:
                 day = str(rr.get("day") or rr.get("date") or "")[:10]
                 tok = str(rr.get("app_token") or "").strip()
@@ -2032,17 +2065,23 @@ def run_event_daily(client: bigquery.Client | None, tokens: list[str], start: da
                     "_ingested_at": now,
                     "_run_id": RUN_ID,
                 })
-                all_rows.append(rec)
+                batch.append(rec)
+            if writer is not None:
+                writer.add(batch)
+            else:
+                all_rows.extend(batch)
+            del batch, raw
             ok_tokens.update(app_chunk)
             if completed % 50 == 0:
-                log.info("Event daily fetch progress %d/%d", completed, len(jobs))
+                log.info("Event daily fetch progress %d/%d%s", completed, len(jobs), _rss_hint())
 
     if DRY_RUN:
         log.info("[DRY] event_daily rows=%d events=%d", len(all_rows), len(events))
         return
     assert client is not None
     atomic_replace_window(client, "event_daily_performance", all_rows, schema, ok_tokens, start, end,
-                          cluster=["app_token", "event_slug", "partner", "campaign_id_network"])
+                          cluster=["app_token", "event_slug", "partner", "campaign_id_network"],
+                          writer=writer)
 
 
 def build_event_cohort_metric_map(event_slug: str, periods: list[str]):
@@ -2061,6 +2100,9 @@ def run_event_cohort(client: bigquery.Client | None, tokens: list[str], start: d
     dims = negotiate_dimensions(dims, tokens[0], sample_start, sample_end)
     schema = cohort_schema(dims, list(EVENT_COHORT_FAMILIES.keys()), event=True)
     all_rows: list[dict[str, Any]] = []
+    # 🔴 v4.8: streaming + bounded. event_cohort 29 min chal kar OOM par mara
+    #    tha (run #98) — saarey futures ek saath + all_rows mein sab jama.
+    writer = StagingWriter(client, "event_cohort_daily_performance", schema) if (client is not None and not DRY_RUN) else None
     ok_tokens: set[str] = set()
     now = datetime.now(timezone.utc).isoformat()
 
@@ -2088,9 +2130,14 @@ def run_event_cohort(client: bigquery.Client | None, tokens: list[str], start: d
             return ev, slug, eligible_tokens, supported, by_period
 
         prepared = []
-        with ThreadPoolExecutor(max_workers=worker_count(len(events)), thread_name_prefix="adjust-eventcohort-probe") as pool:
-            futures = [pool.submit(prepare_event, ev) for ev in events]
-            for fut in as_completed(futures):
+        for _pf in _bounded_map(prepare_event, events, worker_count(len(events)), "adjust-eventcohort-probe"):
+            class _F:
+                def __init__(self, r): self._r = r
+                def result(self):
+                    if isinstance(self._r, Exception): raise self._r
+                    return self._r
+            fut = _F(_pf)
+            if True:
                 try:
                     item = fut.result()
                     if item is not None:
@@ -2113,18 +2160,16 @@ def run_event_cohort(client: bigquery.Client | None, tokens: list[str], start: d
             return ev, slug, supported, by_period, ci, app_chunk, raw
 
         completed = 0
-        with ThreadPoolExecutor(max_workers=worker_count(len(jobs)), thread_name_prefix="adjust-eventcohort") as pool:
-            futures = [pool.submit(fetch_event_cohort_job, job) for job in jobs]
-            for fut in as_completed(futures):
+        for res in _bounded_map(fetch_event_cohort_job, jobs, worker_count(len(jobs)), "adjust-eventcohort"):
                 completed += 1
-                try:
-                    ev, slug, supported, by_period, ci, app_chunk, raw = fut.result()
-                except Exception as exc:
-                    record_failure(f"event_cohort:{maturity}:worker", exc)
+                if isinstance(res, Exception):
+                    record_failure(f"event_cohort:{maturity}:worker", res)
                     continue
+                ev, slug, supported, by_period, ci, app_chunk, raw = res
                 if raw is None:
                     record_failure(f"event_cohort:{maturity}:{slug}:chunk{ci}", "fetch failed")
                     continue
+                batch: list[dict[str, Any]] = []
                 for rr in raw:
                     day = str(rr.get("day") or rr.get("date") or "")[:10]
                     tok = str(rr.get("app_token") or "").strip()
@@ -2151,17 +2196,23 @@ def run_event_cohort(client: bigquery.Client | None, tokens: list[str], start: d
                                 rec[field] = _num(rr.get(ms))
                         rec["_ingested_at"] = now
                         rec["_run_id"] = RUN_ID
-                        all_rows.append(rec)
+                        batch.append(rec)
+                if writer is not None:
+                    writer.add(batch)
+                else:
+                    all_rows.extend(batch)
+                del batch, raw
                 ok_tokens.update(app_chunk)
                 if completed % 50 == 0:
-                    log.info("Event cohort [%s] fetch progress %d/%d", maturity, completed, len(jobs))
+                    log.info("Event cohort [%s] fetch progress %d/%d%s", maturity, completed, len(jobs), _rss_hint())
 
     if DRY_RUN:
         log.info("[DRY] event_cohort rows=%d events=%d periods=%d", len(all_rows), len(events), len(periods))
         return
     assert client is not None
     atomic_replace_window(client, "event_cohort_daily_performance", all_rows, schema, ok_tokens, start, end,
-                          cluster=["app_token", "event_slug", "cohort_period", "campaign_id_network"])
+                          cluster=["app_token", "event_slug", "cohort_period", "campaign_id_network"],
+                          writer=writer)
 
 
 # -----------------------------------------------------------------------------
@@ -2172,7 +2223,7 @@ def main() -> None:
     #    step isi ko grep karta hai. Badlo to workflow bhi badalna parega.
     # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI — workflow ka "Verify loader" grep.
     # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI — workflow ka "Verify loader" grep.
-    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT | loader v4.7 (RSS-based flush)")
+    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT | loader v4.8 (all reports streaming)")
     log.info("Workers: %d | max Adjust HTTP in-flight: %d | persist_catalogs=%s", MAX_WORKERS, MAX_HTTP_IN_FLIGHT, PERSIST_CATALOGS)
     for name, value in (
         ("ADJUST_API_TOKEN", ADJUST_API_TOKEN),
