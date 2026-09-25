@@ -82,10 +82,7 @@ jobs:
       #    OPTIONAL (spend/cohort/event_cohort) abhi tajurbati hain — un ka fail
       #    hona CORE ko nahi girata. (2026-09-23: teen run LAAL huin sirf optional
       #    ki wajah se, jabke app/country/event kaamyab the.)
-      matrix_core: ${{ steps.profile.outputs.matrix_core }}
-      matrix_optional: ${{ steps.profile.outputs.matrix_optional }}
-      has_core: ${{ steps.profile.outputs.has_core }}
-      has_optional: ${{ steps.profile.outputs.has_optional }}
+      matrix: ${{ steps.profile.outputs.matrix }}
       lookback: ${{ steps.profile.outputs.lookback }}
       cohort_lookback: ${{ steps.profile.outputs.cohort_lookback }}
       chunk: ${{ steps.profile.outputs.chunk }}
@@ -152,36 +149,28 @@ jobs:
           #    hai. Python fail karta, eval kaamyab dikhta, aur agli line
           #    "MATRIX_CORE: unbound variable" par marti — asal wajah kabhi
           #    log mein nahi aati thi. Ab exit code check hota hai.
+          # 🔑 v4.0: EK matrix. Har entry mein `report` + `optional` flag.
+          #    Pehle DO matrix aur DO jobs the — wahi ~100 lines do jagah, aur
+          #    har fix do baar karna parta tha (ek bhool = bug).
           if ! MATRIX_OUT=$(REPORTS="$REPORTS" python - <<'PY'
           import json, os
           CORE     = ['app', 'campaign', 'country', 'event']
           OPTIONAL = ['spend', 'cohort', 'event_cohort']
           requested = {x.strip() for x in os.environ['REPORTS'].split(',') if x.strip()}
-          core = [x for x in CORE if x in requested]
-          opt  = [x for x in OPTIONAL if x in requested]
-          if not core and not opt:
+          entries = ([{'report': r, 'optional': False} for r in CORE     if r in requested]
+                   + [{'report': r, 'optional': True}  for r in OPTIONAL if r in requested])
+          if not entries:
               raise SystemExit('No valid reports selected')
-          # GitHub khali matrix par error deta hai — placeholder + has_* flag se skip.
-          print("MATRIX_CORE='%s'" % json.dumps({'report': core or ['app']}, separators=(',', ':')))
-          print("MATRIX_OPT='%s'"  % json.dumps({'report': opt  or ['spend']}, separators=(',', ':')))
-          print("HAS_CORE='%s'" % ('1' if core else '0'))
-          print("HAS_OPT='%s'"  % ('1' if opt  else '0'))
+          print("MATRIX='%s'" % json.dumps({'include': entries}, separators=(',', ':')))
           PY
           ); then
-            echo "::error::Reports list galat hai (REPORTS='$REPORTS'). Sahi values: app, campaign, country, spend, cohort, event, event_cohort"
+            echo "::error::Reports list galat hai (REPORTS='$REPORTS'). Sahi: app, campaign, country, spend, cohort, event, event_cohort"
             exit 1
           fi
           eval "$MATRIX_OUT"
+          : "${MATRIX:?matrix set nahi hua}"
 
-          # 🛡️ Agar eval ke baad bhi set na hon to abhi saaf error do,
-          #    agli line par "unbound variable" ka paheli nahi.
-          : "${MATRIX_CORE:?matrix_core set nahi hua}"
-          : "${MATRIX_OPT:?matrix_optional set nahi hua}"
-
-          echo "matrix_core=$MATRIX_CORE"     >> "$GITHUB_OUTPUT"
-          echo "matrix_optional=$MATRIX_OPT"  >> "$GITHUB_OUTPUT"
-          echo "has_core=$HAS_CORE"           >> "$GITHUB_OUTPUT"
-          echo "has_optional=$HAS_OPT"        >> "$GITHUB_OUTPUT"
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
           echo "lookback=$LOOKBACK" >> "$GITHUB_OUTPUT"
           echo "cohort_lookback=$COHORT_LOOKBACK" >> "$GITHUB_OUTPUT"
           echo "chunk=$INPUT_CHUNK" >> "$GITHUB_OUTPUT"
@@ -195,14 +184,15 @@ jobs:
           echo "profile=$PROFILE" >> "$GITHUB_OUTPUT"
 
           echo "Profile: $PROFILE"
-          echo "CORE matrix    : $MATRIX_CORE (enabled=$HAS_CORE)"
-          echo "OPTIONAL matrix: $MATRIX_OPT (enabled=$HAS_OPT)"
+          echo "Matrix: $MATRIX"
           echo "Flat lookback: $LOOKBACK"
           echo "Cohort lookback: $COHORT_LOOKBACK"
 
-  sync_core:
+  sync:
     name: Adjust ${{ matrix.report }} → BigQuery
-    if: needs.prepare.outputs.has_core == '1'
+    # 🔑 v4.0: OPTIONAL reports fail hon to workflow LAAL na ho. Flag matrix se
+    #    aata hai — alag job ki zaroorat nahi.
+    continue-on-error: ${{ matrix.optional }}
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 300
@@ -211,7 +201,7 @@ jobs:
       # 🔑 v3.5: CHAARON core reports EK SAATH. Pehle 2 the — campaign ko apni
       #    bari ka intezaar karna parta tha, jis se poori run lambi hoti thi.
       max-parallel: 4
-      matrix: ${{ fromJson(needs.prepare.outputs.matrix_core) }}
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
 
     steps:
       - name: Checkout
@@ -262,19 +252,16 @@ jobs:
           # 🔑 v3.5 STREAMING: rows memory mein jama karne ke bajaye har 50k par
           #    staging table mein chale jate hain. Isi se campaign ka OOM gaya —
           #    "The operation was canceled." ab nahi aayega.
+          # 🔑 v4.0: workers / chunk / date-chunk ab LOADER tay karta hai
+          #    (REPORT_TUNING dict). Pehle multi-line GitHub expressions the,
+          #    do jagah likhe hue, parhne mein na-mumkin.
+          SPEED: ${{ inputs.speed || 'fast' }}
           STREAM_FLUSH_ROWS: '50000'
 
           # 🔴 v3.7: buffer ki had 400 MB → 120 MB. Runner par bohot si aur
           #    cheezein bhi memory leti hain (HTTP responses, JSON parse).
           STREAM_MAX_BYTES: '120000000'
 
-          # 🔑 v3.5 DATE CHUNKING: campaign sab se bhaari (23 dims × 150 metrics).
-          #    7-din ke tukron mein har request chhoti rehti hai.
-          # 🔴 v3.7: cohort ko bhi date-chunking. Us ka window 150 din ka hai.
-          DATE_CHUNK_DAYS: >-
-            ${{ (matrix.report == 'campaign' && '7')
-                || (matrix.report == 'cohort' && '15')
-                || '0' }}
 
           # 🔑 v3.5 COHORT PERIOD BATCH: 66 families × 121 periods = ~8,000
           #    metrics ek request mein — negotiation girti thi. 10 ke batches.
@@ -283,218 +270,10 @@ jobs:
           START_DATE: ${{ needs.prepare.outputs.start_date }}
           END_DATE: ${{ needs.prepare.outputs.end_date }}
 
-          CHUNK_SIZE: ${{ needs.prepare.outputs.chunk }}
           METRIC_BATCH_SIZE: ${{ needs.prepare.outputs.metric_batch }}
 
-          # 🔑 v3.5 RAFTAAR — do cheezein tay karti hain:
-          #    (a) report ka WAZAN: campaign/cohort/spend/event_cohort bhaari
-          #        hain, unhe zyada workers se faida; app/country/event chhote.
-          #    (b) `speed` input: balanced / fast / max
-          #
-          #    Global HTTP concurrency (saarey 7 reports ek saath):
-          #       balanced → ~22   fast → ~44   max → ~66   (default: MAX)
-          #    Scheduled run par input khali hota hai → fallback bhi MAX hai.
-          #
-          #    ⚠️ Adjust par rate limit hai. 429 par loader khud backoff karta
-          #       hai (RETRYABLE_STATUS mein 429 hai), magar bohot 429 aayein to
-          #       ULTA SUST ho jata hai. 'fast' se shuru karein; log mein
-          #       "retrying in Ns" bohot dikhe to 'balanced' kar dein.
-          MAX_WORKERS: >-
-            ${{ (contains('campaign cohort event_cohort spend', matrix.report)
-                 && (inputs.speed == 'balanced' && '2' || inputs.speed == 'fast' && '3' || '4'))
-                || (inputs.speed == 'balanced' && '4' || inputs.speed == 'fast' && '8' || '12') }}
-
-          # HTTP gate = workers. Kam rakhne ka faida nahi — workers khali baithenge.
-          MAX_HTTP_IN_FLIGHT: >-
-            ${{ (contains('campaign cohort event_cohort spend', matrix.report)
-                 && (inputs.speed == 'balanced' && '2' || inputs.speed == 'fast' && '3' || '4'))
-                || (inputs.speed == 'balanced' && '4' || inputs.speed == 'fast' && '8' || '12') }}
-
-          # 🔑 CHUNK_SIZE: ek request mein kitne app tokens. Bara chunk = kam
-          #    requests = tez. Streaming ki wajah se memory ab masla nahi.
-          #    141 apps: 25 → 6 requests, 50 → 3 requests per window.
-          # 🔴 v3.7 (2026-09-25): BHAARI reports ko CHHOTA chunk, halke ko BARA.
-          #    Pehle main ne ULTA kiya tha — campaign (23 dims × 150 metrics) ko
-          #    sab se bara chunk (50 apps) aur sab se zyada workers (12) diye the.
-          #    Natija: 12 concurrent × 50 apps × 23 dims ka JSON response ek saath
-          #    memory mein → runner OOM → "The operation was canceled."
-          #    SABOOT: spend (11 dims) 1,913,900 rows ke saath KAAMYAB chala,
-          #            campaign (23 dims) write se pehle hi mar gaya.
-          #    Ab: campaign/cohort → 10 apps per request, 4 workers.
-          #        Zyada requests, magar har ek chhoti — yehi mehfooz hai.
-          CHUNK_SIZE: >-
-            ${{ (contains('campaign cohort event_cohort spend', matrix.report)
-                 && (inputs.speed == 'balanced' && '5' || inputs.speed == 'fast' && '8' || '10'))
-                || (inputs.speed == 'balanced' && '25' || '50') }}
-
-          # 🔧 v3.5: purana `MAX_HTTP_IN_FLIGHT: '4'` yahan se hataya — wo upar
-          #    wali speed-aware value ko override kar raha tha, jis se 12 workers
-          #    banane ke bawajood sirf 4 requests chal patin (workers khali baithe).
-          MAX_RETRIES: '8'
-          REQUEST_TIMEOUT: '300'
-
-          REPORTS: ${{ matrix.report }}
-          COHORT_PERIODS: ${{ needs.prepare.outputs.cohort_periods }}
-          EVENT_COHORT_PERIODS: ${{ needs.prepare.outputs.event_periods }}
-          INCLUDE_WEEKLY_MONTHLY_COHORTS: ${{ needs.prepare.outputs.include_wm }}
-          COHORT_MATURITIES: 'immature,mature'
-
-          ATTRIBUTION_SOURCE: dynamic
-          ATTRIBUTION_TYPES: ''
-          AD_SPEND_MODE: network
-          SPEND_RECON_MODES: 'adjust,network,mixed'
-
-          REPORTING_CURRENCY: USD
-          UTC_OFFSET: '+00:00'
-          DRY_RUN: ${{ needs.prepare.outputs.dry_run }}
-
-          # 🛡️ v3.3: 0 rows aane par purana data URAYA na jaye.
-          ALLOW_EMPTY_WIPE: ${{ inputs.allow_empty_wipe || '0' }}
-
-          # Only one concurrent matrix job should rewrite the shared catalogs.
-          PERSIST_CATALOGS: ${{ matrix.report == 'app' && '1' || '0' }}
-
-        run: python adjust_to_bigquery.py
-
-      - name: Job summary
-        if: always()
-        run: |
-          {
-            echo "## Adjust report: ${{ matrix.report }}"
-            echo "- Profile: **${{ needs.prepare.outputs.profile }}**"
-            echo "- Result: **${{ job.status }}**"
-            echo "- Per-job workers: **4**"
-            echo "- Per-job HTTP cap: **4**"
-          } >> "$GITHUB_STEP_SUMMARY"
 
 
-  sync_optional:
-    name: Adjust ${{ matrix.report }} → BigQuery (optional)
-    if: needs.prepare.outputs.has_optional == '1'
-    # 🛡️ v3.3: JOB-level — ye reports fail hon to workflow LAAL na ho.
-    continue-on-error: true
-    needs: prepare
-    runs-on: ubuntu-latest
-    timeout-minutes: 300
-    strategy:
-      fail-fast: false
-      # 🔑 v3.5: teeno optional reports ek saath.
-      max-parallel: 3
-      matrix: ${{ fromJson(needs.prepare.outputs.matrix_optional) }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: pip
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_CREDENTIALS_JSON }}
-
-      - name: Install dependencies
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Verify loader
-        run: |
-          set -euo pipefail
-          test -f adjust_to_bigquery.py
-          python -m py_compile adjust_to_bigquery.py
-          grep -q 'v3.2 PARALLEL-REPORT' adjust_to_bigquery.py || {
-            echo '::error::Repo is not running the v3.2 parallel-report loader'
-            exit 1
-          }
-
-      - name: Run ${{ matrix.report }} report
-        env:
-          ADJUST_API_TOKEN: ${{ secrets.ADJUST_API_TOKEN }}
-          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
-          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
-          ADJUST_APP_TOKENS: ${{ secrets.ADJUST_APP_TOKENS }}
-
-          APP_TOKENS_FILE: app_tokens.txt
-          BQ_DATASET: adjust_data
-          BQ_LOCATION: US
-
-          # 🔑 POORA window — har report ke liye. Bhaari reports ka hal
-          #    streaming + chunking se nikala hai, window kaat kar nahi.
-          LOOKBACK_DAYS: ${{ needs.prepare.outputs.lookback }}
-
-          # 🔑 v3.5 STREAMING: rows memory mein jama karne ke bajaye har 50k par
-          #    staging table mein chale jate hain. Isi se campaign ka OOM gaya —
-          #    "The operation was canceled." ab nahi aayega.
-          STREAM_FLUSH_ROWS: '50000'
-
-          # 🔴 v3.7: buffer ki had 400 MB → 120 MB. Runner par bohot si aur
-          #    cheezein bhi memory leti hain (HTTP responses, JSON parse).
-          STREAM_MAX_BYTES: '120000000'
-
-          # 🔑 v3.5 DATE CHUNKING: campaign sab se bhaari (23 dims × 150 metrics).
-          #    7-din ke tukron mein har request chhoti rehti hai.
-          # 🔴 v3.7: cohort ko bhi date-chunking. Us ka window 150 din ka hai.
-          DATE_CHUNK_DAYS: >-
-            ${{ (matrix.report == 'campaign' && '7')
-                || (matrix.report == 'cohort' && '15')
-                || '0' }}
-
-          # 🔑 v3.5 COHORT PERIOD BATCH: 66 families × 121 periods = ~8,000
-          #    metrics ek request mein — negotiation girti thi. 10 ke batches.
-          COHORT_PERIOD_BATCH: '10'
-          COHORT_LOOKBACK_DAYS: ${{ needs.prepare.outputs.cohort_lookback }}
-          START_DATE: ${{ needs.prepare.outputs.start_date }}
-          END_DATE: ${{ needs.prepare.outputs.end_date }}
-
-          CHUNK_SIZE: ${{ needs.prepare.outputs.chunk }}
-          METRIC_BATCH_SIZE: ${{ needs.prepare.outputs.metric_batch }}
-
-          # 🔑 v3.5 RAFTAAR — do cheezein tay karti hain:
-          #    (a) report ka WAZAN: campaign/cohort/spend/event_cohort bhaari
-          #        hain, unhe zyada workers se faida; app/country/event chhote.
-          #    (b) `speed` input: balanced / fast / max
-          #
-          #    Global HTTP concurrency (saarey 7 reports ek saath):
-          #       balanced → ~22   fast → ~44   max → ~66   (default: MAX)
-          #    Scheduled run par input khali hota hai → fallback bhi MAX hai.
-          #
-          #    ⚠️ Adjust par rate limit hai. 429 par loader khud backoff karta
-          #       hai (RETRYABLE_STATUS mein 429 hai), magar bohot 429 aayein to
-          #       ULTA SUST ho jata hai. 'fast' se shuru karein; log mein
-          #       "retrying in Ns" bohot dikhe to 'balanced' kar dein.
-          MAX_WORKERS: >-
-            ${{ (contains('campaign cohort event_cohort spend', matrix.report)
-                 && (inputs.speed == 'balanced' && '2' || inputs.speed == 'fast' && '3' || '4'))
-                || (inputs.speed == 'balanced' && '4' || inputs.speed == 'fast' && '8' || '12') }}
-
-          # HTTP gate = workers. Kam rakhne ka faida nahi — workers khali baithenge.
-          MAX_HTTP_IN_FLIGHT: >-
-            ${{ (contains('campaign cohort event_cohort spend', matrix.report)
-                 && (inputs.speed == 'balanced' && '2' || inputs.speed == 'fast' && '3' || '4'))
-                || (inputs.speed == 'balanced' && '4' || inputs.speed == 'fast' && '8' || '12') }}
-
-          # 🔑 CHUNK_SIZE: ek request mein kitne app tokens. Bara chunk = kam
-          #    requests = tez. Streaming ki wajah se memory ab masla nahi.
-          #    141 apps: 25 → 6 requests, 50 → 3 requests per window.
-          # 🔴 v3.7 (2026-09-25): BHAARI reports ko CHHOTA chunk, halke ko BARA.
-          #    Pehle main ne ULTA kiya tha — campaign (23 dims × 150 metrics) ko
-          #    sab se bara chunk (50 apps) aur sab se zyada workers (12) diye the.
-          #    Natija: 12 concurrent × 50 apps × 23 dims ka JSON response ek saath
-          #    memory mein → runner OOM → "The operation was canceled."
-          #    SABOOT: spend (11 dims) 1,913,900 rows ke saath KAAMYAB chala,
-          #            campaign (23 dims) write se pehle hi mar gaya.
-          #    Ab: campaign/cohort → 10 apps per request, 4 workers.
-          #        Zyada requests, magar har ek chhoti — yehi mehfooz hai.
-          CHUNK_SIZE: >-
-            ${{ (contains('campaign cohort event_cohort spend', matrix.report)
-                 && (inputs.speed == 'balanced' && '5' || inputs.speed == 'fast' && '8' || '10'))
-                || (inputs.speed == 'balanced' && '25' || '50') }}
 
           # 🔧 v3.5: purana `MAX_HTTP_IN_FLIGHT: '4'` yahan se hataya — wo upar
           #    wali speed-aware value ko override kar raha tha, jis se 12 workers
@@ -539,34 +318,25 @@ jobs:
 
   final:
     name: Adjust sync summary
-    needs: [prepare, sync_core, sync_optional]
+    needs: [prepare, sync]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      # 🔑 v3.3: SIRF sync_core ka nateeja workflow ka nateeja hai.
-      #    Koi `gh api` nahi — job-level results kaafi hain (permissions bhi
-      #    nahi chahiyen; purani koshish `actions: read` na hone par 403 deti).
+      # 🔑 v4.0: matrix ki OPTIONAL entries par `continue-on-error: true` hai,
+      #    is liye un ka fail hona `needs.sync.result` ko nahi chhoota.
+      #    Yani `sync.result` = sirf CORE ka nateeja. Bas isi ko dekho.
       - name: Final result
         run: |
           set -uo pipefail
-          CORE='${{ needs.sync_core.result }}'
-          OPT='${{ needs.sync_optional.result }}'
+          R='${{ needs.sync.result }}'
           {
             echo "## Adjust sync — ${{ needs.prepare.outputs.profile }}"
-            echo "- CORE (app, campaign, country, event): **$CORE**"
-            echo "- OPTIONAL (spend, cohort, event_cohort): **$OPT**"
+            echo "- CORE (app, campaign, country, event): **$R**"
+            echo "- OPTIONAL (spend, cohort, event_cohort): un ke apne job dekhein"
           } >> "$GITHUB_STEP_SUMMARY"
-
-          echo "CORE=$CORE  OPTIONAL=$OPT"
-
-          if [[ "$CORE" == 'failure' || "$CORE" == 'cancelled' ]]; then
-            echo '::error::CORE Adjust reports fail huin — ye asli masla hai.'
+          echo "CORE result = $R"
+          if [[ "$R" == 'failure' || "$R" == 'cancelled' ]]; then
+            echo '::error::CORE Adjust report fail hui.'
             exit 1
           fi
-
-          if [[ "$OPT" == 'failure' || "$OPT" == 'cancelled' ]]; then
-            echo '::warning::Optional report (spend/cohort/event_cohort) fail hui. CORE theek hai, workflow GREEN. Us matrix job ka log dekhein.'
-            echo "- 🟡 Optional report fail hui — us job ka log dekhein" >> "$GITHUB_STEP_SUMMARY"
-          fi
-
           echo '✅ CORE Adjust reports mukammal.'
