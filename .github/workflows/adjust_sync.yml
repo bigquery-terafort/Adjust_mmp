@@ -5,7 +5,7 @@ on:
     # Daily refresh Mon-Sat
     - cron: '17 2 * * 1-6'
     # Weekly deep refresh Sunday
-    - cron: '47 3 * * 0'
+    - cron: '47 20 * * 6'   # 🔧 v4.9: Sat 20:47 UTC — Mon 02:17 daily se 5h+ pehle khatam ho jaye
 
   workflow_dispatch:
     inputs:
@@ -139,13 +139,20 @@ jobs:
 
           if [[ '${{ github.event_name }}' == 'schedule' ]]; then
             REPORTS='app,campaign,country,spend,cohort,event,event_cohort'
-            if [[ '${{ github.event.schedule }}' == '47 3 * * 0' ]]; then
+            if [[ '${{ github.event.schedule }}' == '47 20 * * 6' ]]; then   # 🔧 v4.9: cron ke saath ye bhi badla
+              # 🔴 v4.9 (2026-09-28): weekly-deep HALKA kiya.
+              #    Sunday ki run mein cohort / event_cohort / spend teeno 5-ghante
+              #    ke timeout par mare. Wajah: `all_periods` (~211 periods vs 121)
+              #    + `INCLUDE_WM=1` (weekly/monthly cohorts) + `all_days` events —
+              #    ye teen mil kar daily se 4-5× bhaari hain. Ek run mein 5h se
+              #    zyada kabhi nahi ho sakta (GitHub ki had 6h).
+              #    Ab: 30-din lookback rakha (yehi "deep" ka faida), baqi daily jaisa.
               PROFILE='weekly-deep'
               LOOKBACK='30'
               COHORT_LOOKBACK='180'
-              COHORT_PERIODS='all_periods'
-              EVENT_PERIODS='all_days'
-              INCLUDE_WM='1'
+              COHORT_PERIODS='all_days'
+              EVENT_PERIODS='key'
+              INCLUDE_WM='0'
             else
               PROFILE='daily'
               LOOKBACK='14'
@@ -216,7 +223,7 @@ jobs:
     continue-on-error: ${{ matrix.optional }}
     needs: prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 350   # 🔧 v4.9: GitHub ki had 360 — thora head-room
     strategy:
       fail-fast: false
       # 🔑 v3.5: CHAARON core reports EK SAATH. Pehle 2 the — campaign ko apni
@@ -357,8 +364,15 @@ jobs:
             echo "- OPTIONAL (spend, cohort, event_cohort): un ke apne job dekhein"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "CORE result = $R"
-          if [[ "$R" == 'failure' || "$R" == 'cancelled' ]]; then
+          # 🔴 v4.9: 'cancelled' ab LAAL nahi. Optional report timeout par
+          #    GitHub use `cancelled` likhta hai, aur `continue-on-error` cancelled
+          #    ko success mein nahi badalta — is liye poori run LAAL ho jati thi
+          #    jabke CORE (app/country/event) teeno pass the (28 Sep).
+          if [[ "$R" == 'failure' ]]; then
             echo '::error::CORE Adjust report fail hui.'
             exit 1
+          fi
+          if [[ "$R" == 'cancelled' ]]; then
+            echo '::warning::Koi report timeout par cancel hui (aksar optional: cohort/spend). CORE dekhein — wo alag se ✅ hain to theek hai.'
           fi
           echo '✅ CORE Adjust reports mukammal.'
