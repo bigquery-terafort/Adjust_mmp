@@ -211,9 +211,14 @@ REPORT_TUNING: dict[str, dict[str, int]] = {
     #    window 5 din — har fetch ~8x chhoti, RAM 1-2 GB mein rehti hai.
     # 🔴 v4.7: run #99 — campaign 10 apps × 7 din par bhi RAM 10 GB. Ab 3 apps
     #    × 3 din: har fetch ~8× chhoti. Requests zyada, magar har ek halki.
-    "campaign":      {"workers": 3,  "chunk": 3,  "date_days": 3,  "capped": 1},
-    "cohort":        {"workers": 3,  "chunk": 3,  "date_days": 3,  "capped": 1},
-    "event_cohort":  {"workers": 3,  "chunk": 3,  "date_days": 3,  "capped": 1},
+    # 🔧 v4.9 (2026-09-28): manual run #102 mein campaign 1h, cohort 1h23m+,
+    #    event_cohort 53m, spend 29m — RAM theek rahi (RSS guard chala). Ab
+    #    workers 3 → 5 aur chunk 3 → 5: ~2× tez. RSS guard (2,500 MB) barqarar
+    #    hai — RAM barhi to khud flush ho jayega. Weekly-deep par bhi 5h mein
+    #    aa jana chahiye.
+    "campaign":      {"workers": 5,  "chunk": 5,  "date_days": 3,  "capped": 1},
+    "cohort":        {"workers": 5,  "chunk": 5,  "date_days": 5,  "capped": 1},
+    "event_cohort":  {"workers": 5,  "chunk": 5,  "date_days": 5,  "capped": 1},
     "spend":         {"workers": 6,  "chunk": 15, "date_days": 0,  "capped": 1},
     "app":           {"workers": 12, "chunk": 50, "date_days": 0,  "capped": 0},
     "country":       {"workers": 10, "chunk": 40, "date_days": 0,  "capped": 0},
@@ -2223,7 +2228,7 @@ def main() -> None:
     #    step isi ko grep karta hai. Badlo to workflow bhi badalna parega.
     # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI — workflow ka "Verify loader" grep.
     # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI — workflow ka "Verify loader" grep.
-    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT | loader v4.8 (all reports streaming)")
+    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT | loader v4.9 (tuned)")
     log.info("Workers: %d | max Adjust HTTP in-flight: %d | persist_catalogs=%s", MAX_WORKERS, MAX_HTTP_IN_FLIGHT, PERSIST_CATALOGS)
     for name, value in (
         ("ADJUST_API_TOKEN", ADJUST_API_TOKEN),
