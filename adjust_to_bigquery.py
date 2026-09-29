@@ -1125,43 +1125,6 @@ def get_bq_client() -> bigquery.Client:
     return bigquery.Client(project=GCP_PROJECT, credentials=creds, location=BQ_LOCATION)
 
 
-# ══ 🔴 v5.0 (2026-09-28) — AUTH-RESILIENT BIGQUERY CALLS ═══════════════════
-#  Run #107: cohort 1h 57m chala, 6,054,111 rows staging mein gaye, phir:
-#      google.auth.exceptions.RefreshError: invalid_grant: Invalid JWT Signature
-#  Service-account token har ~60 min expire hota hai. Refresh par Google ne JWT
-#  reject kiya (runner clock drift / transient). Poora 2 ghante ka kaam ek
-#  transient auth error se gaya.
-#  HAL: har BigQuery call is wrapper se — auth error par credentials DOBARA
-#  JSON se banao (naya JWT, nayi timestamp), naya client, retry. 3 koshish,
-#  beech mein 15/30/60 s. Aur kuch bhi ho to wahi exception aage.
-_AUTH_ERR_MARKERS = ("invalid_grant", "Invalid JWT", "RefreshError", "invalid_token",
-                     "Token has been expired", "401", "Unauthorized")
-
-def _is_auth_error(exc: BaseException) -> bool:
-    msg = f"{type(exc).__name__}: {exc}"
-    return any(m in msg for m in _AUTH_ERR_MARKERS)
-
-
-def bq_call(client_holder, fn, *, label: str = "bq"):
-    """`client_holder` = ek-item list [client] taake naya client wapas likh sakein.
-    `fn(client)` chalao; auth error par client rebuild + retry."""
-    waits = (15, 30, 60)
-    for attempt in range(len(waits) + 1):
-        try:
-            return fn(client_holder[0])
-        except Exception as exc:
-            if not _is_auth_error(exc) or attempt >= len(waits):
-                raise
-            log.warning("🔑 %s: auth error (%s) — credentials dobara bana kar %ds baad retry (%d/%d)",
-                        label, str(exc)[:80], waits[attempt], attempt + 1, len(waits))
-            time.sleep(waits[attempt])
-            try:
-                client_holder[0] = get_bq_client()
-            except Exception as rebuild_exc:
-                log.error("🔑 client rebuild bhi fail: %s", rebuild_exc)
-    raise RuntimeError("unreachable")
-
-
 def ensure_dataset(client: bigquery.Client) -> None:
     ds_ref = f"{GCP_PROJECT}.{BQ_DATASET}"
     try:
@@ -1334,8 +1297,6 @@ class StagingWriter:
 
     def __init__(self, client: bigquery.Client, table_name: str,
                  schema: list[bigquery.SchemaField]):
-        # 🔴 v5.0: holder list — auth retry par naya client yahin likha jata hai
-        self._holder = [client]
         self.client = client
         self.schema = schema
         run_suffix = re.sub(r"[^A-Za-z0-9_]", "_", RUN_ID)[-80:]
@@ -1351,12 +1312,7 @@ class StagingWriter:
         if self._created:
             return
         try:
-            t = bigquery.Table(self.ref, schema=self.schema)
-            # 🔧 v5.0: staging table 2 din mein khud delete — orphan na rahe
-            #    (run fail ho jaye to swap nahi hota, staging pari rehti thi).
-            t.expires = datetime.now(timezone.utc) + timedelta(days=2)
-            bq_call(self._holder, lambda c: c.create_table(t, exists_ok=True), label="create-staging")
-            self.client = self._holder[0]
+            self.client.create_table(bigquery.Table(self.ref, schema=self.schema), exists_ok=True)
         except Exception:
             pass
         self._created = True
@@ -1404,24 +1360,19 @@ class StagingWriter:
         if not self._buf:
             return
         self._create()
+        # 🔴 v4.6: ek baar mein sirf `_flush_at` rows lo — poora buffer nahi.
+        #    Warna 350k rows ka JSON ek saath banta hai (≈800 MB spike).
         take = self._flush_at if len(self._buf) > self._flush_at else len(self._buf)
         batch, self._buf = self._buf[:take], self._buf[take:]
-
-        def _load(c):
-            j = c.load_table_from_json(
-                batch, self.ref,
-                job_config=bigquery.LoadJobConfig(
-                    schema=self.schema,
-                    write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-                    source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
-                ),
-            )
-            j.result()
-            return j
-        # 🔴 v5.0: auth error par credentials rebuild + retry — 2 ghante ka
-        #    kaam ek expired token se na jaye (run #107).
-        job = bq_call(self._holder, _load, label=f"flush[{self.name}]")
-        self.client = self._holder[0]
+        job = self.client.load_table_from_json(
+            batch, self.ref,
+            job_config=bigquery.LoadJobConfig(
+                schema=self.schema,
+                write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+                source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+            ),
+        )
+        job.result()
         if job.output_rows != len(batch):
             raise RuntimeError(f"staging row mismatch expected={len(batch)} loaded={job.output_rows}")
         self.total += len(batch)
@@ -1594,11 +1545,7 @@ def atomic_replace_window(client: bigquery.Client, table_name: str, rows: list[d
         SELECT {select_sql} FROM `{staging}`;
         COMMIT TRANSACTION;
         """
-        # 🔴 v5.0: swap query bhi auth-safe — yahi sab se keemti call hai.
-        _h = [client]
-        bq_call(_h, lambda c: c.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params)).result(),
-                label=f"swap[{table_name}]")
-        client = _h[0]
+        client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
 
         # 🛡️ v3.6 POST-SWAP VERIFY: transaction ke baad BigQuery se ginti wapas
         #    parho. Agar target mein utne rows nahi jitne staging mein the, to
@@ -2281,7 +2228,7 @@ def main() -> None:
     #    step isi ko grep karta hai. Badlo to workflow bhi badalna parega.
     # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI — workflow ka "Verify loader" grep.
     # 🔑 "v3.2 PARALLEL-REPORT" string LAZMI — workflow ka "Verify loader" grep.
-    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT | loader v5.0 (auth-resilient)")
+    log.info("🚀 Adjust -> BigQuery v3.2 PARALLEL-REPORT | loader v4.9 (tuned)")
     log.info("Workers: %d | max Adjust HTTP in-flight: %d | persist_catalogs=%s", MAX_WORKERS, MAX_HTTP_IN_FLIGHT, PERSIST_CATALOGS)
     for name, value in (
         ("ADJUST_API_TOKEN", ADJUST_API_TOKEN),
