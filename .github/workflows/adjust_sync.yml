@@ -1,9 +1,9 @@
-name: Adjust → BigQuery HEAVY (campaign · cohort · event_cohort)
+name: Adjust → BigQuery Sync (daily — halke reports)
 
 on:
   schedule:
     # Daily refresh Mon-Sat
-    - cron: '47 4 * * 1-6'   # light (02:17) ke baad — takraav nahi
+    - cron: '17 2 * * 1-6'
     # Weekly deep refresh Sunday
     - cron: '47 20 * * 6'   # 🔧 v4.9: Sat 20:47 UTC — Mon 02:17 daily se 5h+ pehle khatam ho jaye
 
@@ -67,7 +67,7 @@ on:
         default: '0'
 
 concurrency:
-  group: adjust-sync-heavy
+  group: adjust-sync-light
   cancel-in-progress: false
 
 permissions:
@@ -132,13 +132,13 @@ jobs:
           PROFILE='manual'
           LOOKBACK="${INPUT_LOOKBACK:-14}"
           COHORT_LOOKBACK="${INPUT_COHORT_LOOKBACK:-150}"
-          REPORTS="${INPUT_REPORTS:-campaign,cohort,event_cohort}"
+          REPORTS="${INPUT_REPORTS:-app,country,event,spend}"
           COHORT_PERIODS="${INPUT_COHORT_PERIODS:-all_days}"
           EVENT_PERIODS="${INPUT_EVENT_PERIODS:-key}"
           INCLUDE_WM="${INPUT_INCLUDE_WM:-0}"
 
           if [[ '${{ github.event_name }}' == 'schedule' ]]; then
-            REPORTS='campaign,cohort,event_cohort'
+            REPORTS='app,country,event,spend'
             if [[ '${{ github.event.schedule }}' == '47 20 * * 6' ]]; then   # 🔧 v4.9: cron ke saath ye bhi badla
               # 🔴 v4.9 (2026-09-28): weekly-deep HALKA kiya.
               #    Sunday ki run mein cohort / event_cohort / spend teeno 5-ghante
@@ -171,50 +171,34 @@ jobs:
           # 🔑 v4.0: EK matrix. Har entry mein `report` + `optional` flag.
           #    Pehle DO matrix aur DO jobs the — wahi ~100 lines do jagah, aur
           #    har fix do baar karna parta tha (ek bhool = bug).
-          # 🔑 v6.0 — WINDOWED MATRIX (bhaari reports ka asal hal)
-          #    4 din ke logs: OOM (run bari), timeout (run lambi), auth expire
-          #    (run 1h+). Teeno EK wajah: ek job mein 150 din ka data.
-          #    Ab har (report × 30-din window) ALAG job hai: ~20-25 min, apna
-          #    fresh token, apni memory, apna timeout. Ek window fail ho to sirf
-          #    wo dobara. Loader mein KOI badlav nahi — START_DATE/END_DATE
-          #    pehle se support hai, aur DELETE sirf apni window chhoota hai.
-          if ! MATRIX_OUT=$(REPORTS="$REPORTS" LOOKBACK="$LOOKBACK" COHORT_LOOKBACK="$COHORT_LOOKBACK" python - <<'PY'
+          if ! MATRIX_OUT=$(REPORTS="$REPORTS" python - <<'PY'
           import json, os
-          from datetime import date, timedelta
+          # 🔑 v4.3 — CORE = wo reports jo SAABIT tor par chalti hain.
+          #    campaign 2026-09-17 se atki hui hai; CORE mein hone ki wajah se
+          #    poora workflow LAAL kar rahi thi, jabke country/event/spend ka
+          #    data roz theek aa raha tha (925k / 62k / 2.6M rows — 25 Sep).
+          #    Ab campaign OPTIONAL hai: fail ho to bhi workflow GREEN, aur
+          #    baqi ka data rukta nahi. Jab campaign theek ho jaye, us ka naam
+          #    wapas CORE mein daal dena.
+          # 🔑 v6.0 (2026-09-29): SIRF halke reports. Bhaari (campaign, cohort,
+          #    event_cohort) ab adjust_heavy.yml mein hain — un ka fail hona is
+          #    daily pipeline ko kabhi LAAL nahi karega. 4 din ye chaar lagatar
+          #    chalte rahe jabke bhaari wale tootte rahe.
+          CORE     = ['app', 'country', 'event', 'spend']
+          OPTIONAL = []
           requested = {x.strip() for x in os.environ['REPORTS'].split(',') if x.strip()}
-          end = date.today() - timedelta(days=1)
-          def windows(days_back, size):
-              start = end - timedelta(days=max(days_back, 1) - 1)
-              out, cur = [], start
-              while cur <= end:
-                  nxt = min(cur + timedelta(days=size - 1), end)
-                  out.append((cur.isoformat(), nxt.isoformat()))
-                  cur = nxt + timedelta(days=1)
-              return out
-          # report → (lookback, window size)
-          cfg = {
-              'campaign':     (int(os.environ['LOOKBACK']),        7),
-              'cohort':       (int(os.environ['COHORT_LOOKBACK']), 30),
-              'event_cohort': (int(os.environ['COHORT_LOOKBACK']), 30),
-          }
-          entries = []
-          for r in ['campaign', 'cohort', 'event_cohort']:
-              if r not in requested: continue
-              lb, size = cfg[r]
-              for i, (a, b) in enumerate(windows(lb, size), 1):
-                  entries.append({'report': r, 'win': i, 'start': a, 'end': b, 'optional': True})
+          entries = ([{'report': r, 'optional': False} for r in CORE     if r in requested]
+                   + [{'report': r, 'optional': True}  for r in OPTIONAL if r in requested])
           if not entries:
               raise SystemExit('No valid reports selected')
           print("MATRIX='%s'" % json.dumps({'include': entries}, separators=(',', ':')))
-          print("NJOBS='%d'" % len(entries))
           PY
           ); then
-            echo "::error::Reports list galat hai (REPORTS='$REPORTS'). Sahi: campaign, cohort, event_cohort"
+            echo "::error::Reports list galat hai (REPORTS='$REPORTS'). Sahi: app, campaign, country, spend, cohort, event, event_cohort"
             exit 1
           fi
           eval "$MATRIX_OUT"
           : "${MATRIX:?matrix set nahi hua}"
-          echo "Windowed jobs: $NJOBS"
 
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
           echo "lookback=$LOOKBACK" >> "$GITHUB_OUTPUT"
@@ -237,18 +221,18 @@ jobs:
           echo "Cohort lookback: $COHORT_LOOKBACK"
 
   sync:
-    name: ${{ matrix.report }} · w${{ matrix.win }} (${{ matrix.start }} → ${{ matrix.end }})
+    name: Adjust ${{ matrix.report }} → BigQuery
     # 🔑 v4.0: OPTIONAL reports fail hon to workflow LAAL na ho. Flag matrix se
     #    aata hai — alag job ki zaroorat nahi.
     continue-on-error: ${{ matrix.optional }}
     needs: prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 90   # 🔑 v6.0: ek 30-din window ~25 min — 90 mein pakka
+    timeout-minutes: 120   # halke reports 40 min mein — 2h kaafi
     strategy:
       fail-fast: false
       # 🔑 v3.5: CHAARON core reports EK SAATH. Pehle 2 the — campaign ko apni
       #    bari ka intezaar karna parta tha, jis se poori run lambi hoti thi.
-      max-parallel: 4   # 🔑 v6.0: 4 windows ek saath — har ek ~2.5 GB RAM, Adjust gate
+      max-parallel: 4
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
 
     steps:
@@ -296,9 +280,6 @@ jobs:
           # 🔑 POORA window — har report ke liye. Bhaari reports ka hal
           #    streaming + chunking se nikala hai, window kaat kar nahi.
           LOOKBACK_DAYS: ${{ needs.prepare.outputs.lookback }}
-          # 🔑 v6.0: is job ki APNI window — loader sirf itna maangta hai.
-          START_DATE: ${{ matrix.start }}
-          END_DATE: ${{ matrix.end }}
 
           # 🔑 v3.5 STREAMING: rows memory mein jama karne ke bajaye har 50k par
           #    staging table mein chale jate hain. Isi se campaign ka OOM gaya —
@@ -318,6 +299,8 @@ jobs:
           #    metrics ek request mein — negotiation girti thi. 10 ke batches.
           COHORT_PERIOD_BATCH: '10'
           COHORT_LOOKBACK_DAYS: ${{ needs.prepare.outputs.cohort_lookback }}
+          START_DATE: ${{ needs.prepare.outputs.start_date }}
+          END_DATE: ${{ needs.prepare.outputs.end_date }}
 
           METRIC_BATCH_SIZE: ${{ needs.prepare.outputs.metric_batch }}
 
@@ -389,9 +372,9 @@ jobs:
           #    GitHub use `cancelled` likhta hai, aur `continue-on-error` cancelled
           #    ko success mein nahi badalta — is liye poori run LAAL ho jati thi
           #    jabke CORE (app/country/event) teeno pass the (28 Sep).
-          # 🔑 heavy: sab optional — LAAL nahi karte, sirf summary mein likhte hain.
           if [[ "$R" == 'failure' ]]; then
-            echo '::warning::Koi bhaari report fail hui — us job ka log dekhein. Daily pipeline is se alag hai.'
+            echo '::error::CORE Adjust report fail hui.'
+            exit 1
           fi
           if [[ "$R" == 'cancelled' ]]; then
             echo '::warning::Koi report timeout par cancel hui (aksar optional: cohort/spend). CORE dekhein — wo alag se ✅ hain to theek hai.'
